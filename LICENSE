@@ -1,0 +1,25 @@
+Copyright (c) 2026 Valerois AI. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL
+
+The Bifrost architecture, Valkir model family, model weights, training 
+implementations, kernel designs, optimizer stack, and all associated 
+materials described or referenced in this repository are the exclusive 
+intellectual property of Valerois AI.
+
+No part of this repository may be:
+  • Reproduced
+  • Distributed
+  • Modified
+  • Adapted
+  • Reverse-engineered
+  • Used for commercial purposes
+  • Used to train other models
+  • Sublicensed
+
+...without prior written permission from Valerois AI.
+
+This repository is provided for documentation and prior-art disclosure 
+purposes only.
+
+For licensing inquiries: contact@valerois.com
