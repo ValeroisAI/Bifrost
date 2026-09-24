@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Büyük veri ve checkpoint'ler repoya girmez (tools/build_dev_corpus.py ile yeniden üretilir)
+08_BIFROST_H/data/
+*.pt
+checkpoints*/
