@@ -112,6 +112,23 @@ python egit.py --preset temel --uclu --uclu-int8 --hafiza-katmani 4 8 \
 
 Genişlik ve derinlik ön ayardan bağımsız verilebilir: `--d-model`, `--n-layers`, `--n-heads`.
 
+### İlk karşılaştırma (CPU, eşit token)
+d=192, 4 katman, T=256, 1M token, aynı veri sırası. Val loss `stream_coder_100k` üzerinde ölçüldü.
+
+| Koşu | Val loss | Fark |
+|---|---|---|
+| Yoğun (Muon + AdamW) | 2.811 | — |
+| Yoğun + hafıza katmanı (16K yuva) | **2.795** | −0.016 |
+| Üçlü, flip %0.5 | 3.074 | +0.263 |
+| Üçlü, flip %2 | 3.112 | +0.301 |
+| Üçlü + hafıza katmanı | 3.024 | +0.213 |
+| Üçlü, flip 0: gizli katmanlar hiç öğrenmez (alt sınır) | 4.751 | +1.940 |
+
+- **Gizli ağırlıksız üçlü eğitim öğreniyor.** Donuk alt sınır ile yoğun model arasındaki farkın %86'sını kapatıyor.
+- Eşit boyutta yoğun modelden 0.26 nat geride. Asıl soru henüz ölçülmedi: aynı VRAM'e sığan 2.5-3 kat büyük üçlü model, yoğun modeli geçer mi? Bu ölçüm GPU'da yapılmalı.
+- Hafıza katmanı 1M tokende az katkı veriyor, çünkü her yuva birkaç kez görülüyor. Üçlü modelde katkısı daha büyük (−0.05). Etkisi uzun eğitimde ölçülmeli.
+- Bu küçük ölçekte bellek aktivasyonlarla dolu; üçlünün optimizer belleği kazancı ancak büyük modelde görünür.
+
 ## Veri miktarı notu
 `stream_coder_100k.bin` 25.6M token. ~100M'lik bir model için azdır: birkaç epoch'a kadar tekrar sorun değil, ama daha fazlası ezberletir. `fineweb_edu_8k.bin`, `master_code_8k.bin` gibi dosyaları ekle ve val loss'u izle (`[val]` satırları).
 

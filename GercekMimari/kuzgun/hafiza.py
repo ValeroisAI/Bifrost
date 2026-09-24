@@ -7,8 +7,9 @@ Token başına hesap ~ n·d_q + k·d, yani N'den (neredeyse) bağımsız: parame
 
     y = W_o( Σ_i softmax(s)_i · V[idx_i]  ⊙  SiLU(W_g x) )
 
-Değerler seyrek güncellenir (EmbeddingBag sparse=True). SparseRowRMS: satır başına tek ölçek tutan
-hafif optimizer (Adam'ın 2 tam kopyası yerine N sayı).
+Gradyan tablosu yoğundur (N×d, gradyan biriktirmede sabit bellek; seyrek gradyan her okuma için bir satır
+üretir ve biriktirme adımlarında büyür). SparseRowRMS yalnız bu adımda okunan satırları günceller ve satır
+başına tek ölçek tutar (Adam'ın 2 tam kopyası yerine N sayı).
 """
 
 import math
@@ -26,7 +27,7 @@ class ProductKeyMemory(nn.Module):
         self.q_proj = nn.Linear(d_model, heads * d_query, bias=False)
         self.q_norm = nn.LayerNorm(d_query, elementwise_affine=False)
         self.keys = nn.Parameter(torch.randn(heads, 2, n_sub, d_query // 2) / math.sqrt(d_query // 2))
-        self.values = nn.EmbeddingBag(n_sub * n_sub, d_model, mode="sum", sparse=True)
+        self.values = nn.EmbeddingBag(n_sub * n_sub, d_model, mode="sum")
         nn.init.normal_(self.values.weight, std=d_model ** -0.5)
         self.values.weight.sparse_rows = True   # optimizer seçimi için işaret (SparseRowRMS)
         self.g_proj = nn.Linear(d_model, d_model, bias=False)
@@ -51,7 +52,7 @@ class ProductKeyMemory(nn.Module):
         w = torch.softmax(best, dim=-1)
         return idx.reshape(m, -1), (w / self.h).reshape(m, -1)
 
-    @torch.compiler.disable  # seyrek gradyanlı EmbeddingBag derleyicinin dışında kalır
+    @torch.compiler.disable  # EmbeddingBag derleyicinin dışında kalır
     def _read(self, idx, w):
         return self.values(idx, per_sample_weights=w)
 
@@ -65,7 +66,7 @@ class ProductKeyMemory(nn.Module):
 
 
 class SparseRowRMS(torch.optim.Optimizer):
-    """Seyrek gradyanlar için satır başına RMS ölçekli SGD. Durum: satır başına 1 sayı."""
+    """Yalnız gradyanı sıfır olmayan satırları güncelleyen, satır başına RMS ölçekli SGD. Durum: satır başına 1 sayı."""
 
     def __init__(self, params, lr: float = 1e-2, beta: float = 0.99, eps: float = 1e-8) -> None:
         super().__init__(params, dict(lr=lr, beta=beta, eps=eps))
@@ -76,8 +77,12 @@ class SparseRowRMS(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad.coalesce() if p.grad.is_sparse else p.grad.to_sparse().coalesce()
-                rows, vals = g.indices()[0], g.values()
+                if p.grad.is_sparse:
+                    g = p.grad.coalesce()
+                    rows, vals = g.indices()[0], g.values()
+                else:
+                    rows = p.grad.ne(0).any(dim=1).nonzero().squeeze(1)
+                    vals = p.grad[rows]
                 st = self.state[p]
                 v = st.get("v")
                 if v is None:
