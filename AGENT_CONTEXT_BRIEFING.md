@@ -37,6 +37,8 @@ Kullanıcı okul laboratuvarında çalışmaktadır. Bugünkü ana hedef:
 * `05_DOKUMANTASYON_VE_RAPORLAR/`: Tüm teknik kitapçıklar, benchmark analizleri ve 44 deneylik maraton raporları.
 * `06_YENI_FIKIR_V_PDM/`: Sıfırdan katman fikri V-PDM spesifikasyonu ve çalışan PyTorch şablonu.
 * `07_BIFROST_CSL/`: Bifrost CSL, üstel dilatasyonlu CSL (`valerois_exponential_csl.py`), CSL-QV5 üç kanallı katman (`valerois_csl_qv5.py`).
+* `08_BIFROST_H/`: **Güncel ana plan** (`PLAN_BIFROST_H.md`), mimari tanımı (`KUZGUN.md`), durum notu (`DURUM.md`) ve ölçüm betikleri. Yeni işe başlamadan önce `DURUM.md`'yi oku.
+* `GercekMimari/`: ROCm için hazır Kuzgun eğitim sistemi (`egit.py`, `uret.py`, `degerlendir.py`, `araclar/`).
 
 ---
 

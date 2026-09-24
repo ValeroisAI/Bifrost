@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# Üretilen veri, checkpoint ve loglar repoya girmez (yeniden üretilebilir)
+08_BIFROST_H/data/
+08_BIFROST_H/results/**/*.pt
+08_BIFROST_H/results/**/*.log
+GercekMimari/kosular/
+GercekMimari/veri/
+checkpoints*/
