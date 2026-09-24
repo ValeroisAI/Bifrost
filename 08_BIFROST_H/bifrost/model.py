@@ -33,7 +33,8 @@ class Block(nn.Module):
         elif kind in ("K", "W", "R"):
             self.mixer = Kuzgun(d, cfg.kuzgun_heads, cfg.kuzgun_head_dim, cfg.window, cfg.kuzgun_conv,
                                 cfg.mimir_chunk, {"K": "both", "W": "window", "R": "memory"}[kind],
-                                cfg.negative_eigen, coupled_decay=cfg.coupled_decay)
+                                cfg.negative_eigen, coupled_decay=cfg.coupled_decay,
+                                archival_heads=cfg.archival_heads)
         elif kind == "A":
             self.mixer = CausalAttention(d, cfg.attn_heads, cfg.attn_kv_heads, window=cfg.attn_window)
         elif kind == "N":

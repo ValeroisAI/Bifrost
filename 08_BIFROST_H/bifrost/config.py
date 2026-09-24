@@ -37,7 +37,8 @@ class ModelConfig:
     kuzgun_head_dim: int = 64
     window: int = 64
     kuzgun_conv: int = 4
-    coupled_decay: bool = True
+    coupled_decay: bool = False
+    archival_heads: int = 0
     # Eğitim kararlılığı
     logit_softcap: Optional[float] = None
     zero_init_out: bool = False

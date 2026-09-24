@@ -26,5 +26,21 @@
 | Valkir + Mímir ince ayar (9 dk CPU) | Başarısız: güçlü ek kayıp (×2) modeli bağlamdan bağımsız "ortalama sayı" tahminine çöktürdü (kazanç 0) | `bench/valkir_mimir.py` |
 | Sentetik iğne, sıfırdan (CPU 11-25 dk) | Hiçbir model eşiği geçemedi (Transformer %27'de plato). CPU'da bu tür beceri binlerce adım istiyor | `bench/context_test.py` |
 
+## Nihai mimari: Kuzgun (bkz. `KUZGUN.md`)
+Pencere dikkati (Huginn, W token, RoPE) + delta hafıza (Muninn, O(1)), ortak q/k/v, kafa başına kapı.
+Global dikkat yok. Arşiv kafaları (α ≡ 1) uzun mesafe unutmasını çözer.
+
+| Deney (MQAR, d=64, 2 katman, 8 dk CPU) | 16K | 65K | 262K | 1M |
+|---|---|---|---|---|
+| Yalnız hafıza (R) | %100 | %100 | %100 | %100 |
+| Kuzgun (K), unutma tüm kafalarda | %100 | %100 | %3 | %3 |
+| Kuzgun, bağlı unutma | %98 | %59 | %2 | %0 |
+| Tam dikkat (A) | %0 | — | — | — (bu bütçede öğrenemedi: 16 boşlukta %16) |
+| Yalnız pencere (W) | şans | — | — | — |
+
+Tanı (`bench/mqar_diagnose.py`, K_coupled, 65K): normal %58.6 → unutma kapalı (α=1) **%96.1**;
+pencere kolu kapalı %58.6 (etkisiz). Öğrenilen α = 0.99997 → α^65536 = 0.12. Sebep: sızıntılı unutma.
+
 ## Şu anki iş
-Sıfırdan katman tasarımı (max effort oturumu). Bu dosyanın sonuna sonuçlar eklenecek.
+- MQAR: arşiv kafalı Kuzgun ve arşiv kafalı yalnız hafıza (2 kafa × 32, 1 arşiv) — sonuç bekleniyor.
+- Gerçek kod: Kuzgun (6×K, 4 kafa, 2 arşiv) ile Transformer (6×A), eşit 20 dk CPU — sonuç bekleniyor.

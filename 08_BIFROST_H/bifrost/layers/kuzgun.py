@@ -61,7 +61,7 @@ def local_window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, wi
 class Kuzgun(nn.Module):
     def __init__(self, dim: int, num_heads: int, head_dim: int = 64, window: int = 64, conv_kernel: int = 4,
                  chunk_size: int = 64, branches: str = "both", negative_eigen: bool = False,
-                 rope_base: float = 10_000.0, coupled_decay: bool = True) -> None:
+                 rope_base: float = 10_000.0, coupled_decay: bool = False, archival_heads: int = 0) -> None:
         super().__init__()
         if branches not in ("both", "window", "memory"):
             raise ValueError("branches: both | window | memory")
@@ -74,6 +74,11 @@ class Kuzgun(nn.Module):
         self.rope_base = rope_base
         self.beta_scale = 2.0 if negative_eigen else 1.0
         self.coupled_decay = coupled_decay
+        # Arşiv kafaları: ilk `archival_heads` kafada unutma yok (α ≡ 1). Delta kuralı yalnız yazılan
+        # anahtarın yönünü değiştirdiği için önemsiz tokenler diğer anahtarları silemez -> 1M+ token hafıza.
+        decay_mask = torch.ones(num_heads)
+        decay_mask[:archival_heads] = 0.0
+        self.register_buffer("decay_mask", decay_mask, persistent=False)
         inner = num_heads * head_dim
 
         self.qkv = nn.Linear(dim, 3 * inner, bias=False)
@@ -110,6 +115,7 @@ class Kuzgun(nn.Module):
         write = torch.sigmoid(bt)
         if self.coupled_decay:
             g = g * write  # "yazmıyorsan unutma": β→0 olan token hafızayı aşındırmaz (α→1)
+        g = g * self.decay_mask  # arşiv kafaları: α ≡ 1
         return g, self.beta_scale * write  # [B,T,H]
 
     def _combine(self, x: torch.Tensor, o_w: Optional[torch.Tensor], o_m: Optional[torch.Tensor]) -> torch.Tensor:

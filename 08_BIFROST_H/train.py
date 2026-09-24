@@ -70,6 +70,7 @@ def main() -> None:
     p.add_argument("--window", type=int, default=64)
     p.add_argument("--ffn-mult", type=float, default=8 / 3)
     p.add_argument("--csl", action="store_true", help="her bloğa Bifrost CSL v2 ekle")
+    p.add_argument("--archival", type=int, default=0, help="Kuzgun'da unutmayan (α≡1) hafıza kafası sayısı")
     p.add_argument("--softcap", type=float, default=30.0)
     p.add_argument("--minutes", type=float, default=20.0)
     p.add_argument("--threads", type=int, default=1)
@@ -92,7 +93,7 @@ def main() -> None:
     cfg = ModelConfig(vocab_size=8192, dim=args.dim, layout=args.layout, csl=args.csl, ffn_mult=args.ffn_mult,
                       kuzgun_heads=args.heads, kuzgun_head_dim=args.head_dim, window=args.window,
                       mimir_heads=args.heads, attn_heads=args.heads, logit_softcap=args.softcap,
-                      zero_init_out=True)
+                      zero_init_out=True, archival_heads=args.archival)
     model = BifrostLM(cfg)
     optimizers = build_optimizers(model, args.optimizer, args.lr_muon, args.lr_adam)
     train_model = torch.compile(model) if args.compile else model  # değerlendirme derlenmemiş modelle

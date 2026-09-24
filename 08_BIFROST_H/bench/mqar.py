@@ -65,10 +65,10 @@ def make_batch(rng, batch, n_pairs, gap, overwrite_p=0.3):
     return ids, targets
 
 
-def model_for(kind: str, coupled: bool = True) -> BifrostLM:
-    cfg = ModelConfig(vocab_size=VOCAB, dim=64, layout=kind * 2, csl=False, kuzgun_heads=1, kuzgun_head_dim=64,
+def model_for(kind: str, coupled: bool = False, heads: int = 1, head_dim: int = 64, archival: int = 0) -> BifrostLM:
+    cfg = ModelConfig(vocab_size=VOCAB, dim=64, layout=kind * 2, csl=False, kuzgun_heads=heads, kuzgun_head_dim=head_dim,
                       window=16, attn_heads=1, mimir_chunk=64, ffn_mult=2.0, zero_init_out=True,
-                      coupled_decay=coupled)
+                      coupled_decay=coupled, archival_heads=archival)
     return BifrostLM(cfg)
 
 
@@ -105,14 +105,17 @@ def main() -> None:
     p.add_argument("--max-train-gap", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-gap", type=int, default=1 << 20)
-    p.add_argument("--uncoupled", action="store_true", help="eski unutma (β'dan bağımsız)")
+    p.add_argument("--coupled", action="store_true", help="bağlı unutma (log α ← β·log α)")
+    p.add_argument("--heads", type=int, default=1)
+    p.add_argument("--head-dim", type=int, default=64)
+    p.add_argument("--archival", type=int, default=0, help="unutmayan (α≡1) kafa sayısı")
     p.add_argument("--long-gap-p", type=float, default=0.0, help="uzun boşluklu (1K-8K) batch olasılığı")
     p.add_argument("--tag", default="")
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    model = model_for(args.model, coupled=not args.uncoupled)
+    model = model_for(args.model, coupled=args.coupled, heads=args.heads, head_dim=args.head_dim, archival=args.archival)
     name = args.model + (f"_{args.tag}" if args.tag else "")
     opts = build_optimizers(model, "muon")
     print(f"[{args.model}] {model.num_params() / 1e3:.0f}K param | {args.pairs} çift | eğitim boşluğu ≤ {args.max_train_gap}",
@@ -142,19 +145,19 @@ def main() -> None:
             print(f"  adım {step:5d} | {time.time() - t0:5.0f}s | loss {l:.3f} | doğruluk {a:6.1%}", flush=True)
 
     model.eval()
+    out = ROOT / "results" / "mqar"
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"config": model.cfg.to_dict(), "model": model.state_dict()}, out / f"{name}.pt")
     limit = {"A": 16384, "W": 16384}.get(args.model, args.max_gap)
     gaps = [g for g in [0, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576] if g <= limit]
     rows = []
     for g in gaps:
-        n = 256 if g <= 4096 else (32 if g <= 65536 else 8)
+        n = 256 if g <= 1024 else (64 if g <= 16384 else (16 if g <= 65536 else 8))
         acc = accuracy_at_gap(model, g, args.pairs, n, np.random.default_rng(10_000 + g))
         rows.append({"gap": g, "accuracy": acc, "samples": n})
         print(f"  boşluk {g:8d} | doğruluk {acc:6.1%} (n={n})", flush=True)
-    out = ROOT / "results" / "mqar"
-    out.mkdir(parents=True, exist_ok=True)
-    torch.save({"config": model.cfg.to_dict(), "model": model.state_dict()}, out / f"{name}.pt")
     (out / f"{name}.json").write_text(json.dumps({
-        "model": args.model, "tag": args.tag, "coupled_decay": not args.uncoupled, "long_gap_p": args.long_gap_p, "params": model.num_params(), "steps": step, "minutes": args.minutes,
+        "model": args.model, "tag": args.tag, "coupled_decay": args.coupled, "heads": args.heads, "archival": args.archival, "long_gap_p": args.long_gap_p, "params": model.num_params(), "steps": step, "minutes": args.minutes,
         "train_tail": dict(zip(("loss", "acc"), map(float, np.mean(hist[-200:], axis=0)))),
         "chance": 1 / N_VALUES, "results": rows}, indent=2))
 

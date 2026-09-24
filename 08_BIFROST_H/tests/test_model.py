@@ -22,7 +22,7 @@ def tiny(layout, csl):
     torch.manual_seed(0)
     cfg = ModelConfig(vocab_size=97, dim=64, layout=layout, csl=csl, mimir_heads=2, mimir_dk=32,
                       mimir_dv=32, mimir_chunk=16, attn_heads=2, kuzgun_heads=2, kuzgun_head_dim=32,
-                      window=8, logit_softcap=30.0)
+                      window=8, logit_softcap=30.0, archival_heads=1)
     return BifrostLM(cfg).eval()
 
 
