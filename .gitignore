@@ -4,3 +4,4 @@ __pycache__/
 08_BIFROST_H/data/
 *.pt
 checkpoints*/
+08_BIFROST_H/results/**/*.log

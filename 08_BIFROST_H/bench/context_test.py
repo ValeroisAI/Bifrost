@@ -112,6 +112,7 @@ def main() -> None:
     p.add_argument("--length", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--max-distance", type=int, default=1 << 20)
+    p.add_argument("--tag", default="")
     p.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "results" / "context"))
     args = p.parse_args()
 
@@ -155,7 +156,9 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.model}.json").write_text(json.dumps({
+    name = args.model + (f"_{args.tag}" if args.tag else "")
+    torch.save(model.state_dict(), out / f"{name}.pt")
+    (out / f"{name}.json").write_text(json.dumps({
         "model": args.model, "config": cfg.to_dict(), "params": model.num_params(), "train_steps": step,
         "train_length": args.length, "final_train": dict(zip(("loss", "acc"), map(float, np.mean(hist[-100:], axis=0)))),
         "chance": 1 / N_VALUES, "results": rows,
