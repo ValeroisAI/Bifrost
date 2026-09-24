@@ -58,7 +58,7 @@ def fill_with_distractors(rng, length, exclude_key):
     return seq
 
 
-def train_batch(rng, batch, length, n_needles=4, n_queries=3):
+def train_batch(rng, batch, length, n_needles=8, n_queries=8):
     """Eğitim dizisi: n_needles farklı anahtar gömülür, sonda n_queries soru sorulur."""
     xs, ys, ms = [], [], []
     body = length - 3 * n_queries
@@ -69,7 +69,7 @@ def train_batch(rng, batch, length, n_needles=4, n_queries=3):
         slots = rng.choice(body // 3, size=n_needles, replace=False) * 3
         for s, k, v in zip(slots, keys, vals):
             seq[s:s + 3] = (MARK, KEY0 + k, VAL0 + v)
-        ask = rng.choice(n_needles, size=n_queries, replace=True)
+        ask = rng.permutation(n_needles)[:n_queries]
         tail = np.array([[QUERY, KEY0 + keys[a], VAL0 + vals[a]] for a in ask]).ravel()
         full = np.concatenate((seq, tail, [PAD]))
         mask = np.zeros(length, dtype=bool)
