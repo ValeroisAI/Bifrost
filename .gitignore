@@ -5,3 +5,4 @@ __pycache__/
 *.pt
 checkpoints*/
 08_BIFROST_H/results/**/*.log
+08_BIFROST_H/results/**/*.pt

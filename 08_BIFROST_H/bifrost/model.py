@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from .config import ModelConfig
-from .layers import BifrostCSL, CausalAttention, Mimir, RMSNorm, SwiGLU
+from .layers import BifrostCSL, CausalAttention, Kuzgun, Mimir, RMSNorm, SwiGLU
 
 
 class Block(nn.Module):
@@ -30,6 +30,10 @@ class Block(nn.Module):
         if kind == "M":
             self.mixer = Mimir(d, cfg.mimir_heads, cfg.mimir_dk, cfg.mimir_dv, cfg.mimir_conv,
                                cfg.mimir_chunk, cfg.negative_eigen)
+        elif kind in ("K", "W", "R"):
+            self.mixer = Kuzgun(d, cfg.kuzgun_heads, cfg.kuzgun_head_dim, cfg.window, cfg.kuzgun_conv,
+                                cfg.mimir_chunk, {"K": "both", "W": "window", "R": "memory"}[kind],
+                                cfg.negative_eigen, coupled_decay=cfg.coupled_decay)
         elif kind == "A":
             self.mixer = CausalAttention(d, cfg.attn_heads, cfg.attn_kv_heads, window=cfg.attn_window)
         elif kind == "N":
@@ -88,18 +92,26 @@ class BifrostLM(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, (nn.Linear, nn.Embedding)):
                 is_out = name.endswith(("out_proj", "o_proj", "w3"))
-                nn.init.normal_(module.weight, std=out_std if is_out else 0.02)
+                if is_out and self.cfg.zero_init_out:
+                    nn.init.zeros_(module.weight)  # artık dal başta kimlik: derin ağda temiz gradyan akışı
+                else:
+                    nn.init.normal_(module.weight, std=out_std if is_out else 0.02)
                 if getattr(module, "bias", None) is not None:
                     nn.init.zeros_(module.bias)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def _head(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(self.norm(x))
+        cap = self.cfg.logit_softcap
+        return cap * torch.tanh(logits / cap) if cap else logits
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(ids)
         for block in self.blocks:
             x = block(x)
-        return self.lm_head(self.norm(x))
+        return self._head(x)
 
     def init_state(self, batch: int, device=None, dtype=None) -> List[dict]:
         device = device or self.embed.weight.device
@@ -116,7 +128,7 @@ class BifrostLM(nn.Module):
             new_state.append(s)
         if last_only:
             x = x[:, -1:]
-        return self.lm_head(self.norm(x)), new_state
+        return self._head(x), new_state
 
     def step(self, ids: torch.Tensor, state: List[dict]) -> Tuple[torch.Tensor, List[dict]]:
         x = self.embed(ids)
@@ -124,4 +136,4 @@ class BifrostLM(nn.Module):
         for block, s in zip(self.blocks, state):
             x, s = block.step(x, s)
             new_state.append(s)
-        return self.lm_head(self.norm(x)), new_state
+        return self._head(x), new_state

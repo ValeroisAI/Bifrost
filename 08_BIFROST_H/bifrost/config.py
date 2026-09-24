@@ -2,6 +2,9 @@
 Model konfigürasyonu.
 
 `layout` her katmanın token karıştırıcısını belirler (bir harf = bir katman):
+    K : Kuzgun — pencere dikkati (Huginn) + delta hafıza (Muninn), paralel
+    W : Kuzgun yalnız pencere kolu (ablation)
+    R : Kuzgun yalnız hafıza kolu (ablation)
     M : Mímir (kapılı delta hafıza, O(1))
     N : yok (katman yalnız Bifrost CSL + FFN -> saf CSL modeli)
     A : tam nedensel dikkat (YALNIZ Transformer++ baseline'ı için; Bifrost modellerinde kullanılmaz)
@@ -29,6 +32,15 @@ class ModelConfig:
     mimir_conv: int = 4
     mimir_chunk: int = 64
     negative_eigen: bool = False
+    # Kuzgun ('K', 'W', 'R' katmanları)
+    kuzgun_heads: int = 4
+    kuzgun_head_dim: int = 64
+    window: int = 64
+    kuzgun_conv: int = 4
+    coupled_decay: bool = True
+    # Eğitim kararlılığı
+    logit_softcap: Optional[float] = None
+    zero_init_out: bool = False
     # Baseline dikkati ('A' katmanları)
     attn_heads: int = 4
     attn_kv_heads: Optional[int] = None
@@ -47,6 +59,9 @@ class ModelConfig:
 
 
 PRESETS = {
+    # Kuzgun ailesi (global dikkat yok; bellek O(1))
+    "kuzgun-cpu": ModelConfig(dim=256, layout="K" * 6, csl=False, kuzgun_heads=4, window=64,
+                              logit_softcap=30.0, zero_init_out=True),
     # Bifrost ailesi
     "bifrost-nano": ModelConfig(dim=128, layout="MMMM", mimir_heads=2),
     "bifrost-mini": ModelConfig(dim=320, layout="M" * 12, mimir_heads=5),

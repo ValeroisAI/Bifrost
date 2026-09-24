@@ -12,15 +12,17 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bifrost import BifrostLM, ModelConfig  # noqa: E402
+from bifrost.layers.kuzgun import local_window_attention  # noqa: E402
 from bifrost.layers.mimir import _unit_lower_inverse, gated_delta_chunk, gated_delta_recurrent  # noqa: E402
 
-LAYOUTS = [("MMMM", True), ("NNNN", True), ("AAAA", False), ("MAMN", True)]
+LAYOUTS = [("MMMM", True), ("NNNN", True), ("AAAA", False), ("MAMN", True), ("KKWR", False)]
 
 
 def tiny(layout, csl):
     torch.manual_seed(0)
     cfg = ModelConfig(vocab_size=97, dim=64, layout=layout, csl=csl, mimir_heads=2, mimir_dk=32,
-                      mimir_dv=32, mimir_chunk=16, attn_heads=2)
+                      mimir_dv=32, mimir_chunk=16, attn_heads=2, kuzgun_heads=2, kuzgun_head_dim=32,
+                      window=8, logit_softcap=30.0)
     return BifrostLM(cfg).eval()
 
 
@@ -86,3 +88,14 @@ def test_delta_rule_overwrites_same_key():
     beta = torch.ones(1, 1, 3)
     out, _ = gated_delta_recurrent(key, key, values, g, beta)
     torch.testing.assert_close(out[0, 0, -1], values[0, 0, -1], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("t,w", [(37, 8), (64, 16), (5, 8), (40, 1 + 39)])
+def test_local_window_attention_matches_masked_full(t, w):
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 3, t, 16) for _ in range(3))
+    i = torch.arange(t)
+    dist = i[:, None] - i[None, :]
+    mask = (dist >= 0) & (dist < w)
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.0)
+    torch.testing.assert_close(local_window_attention(q, k, v, w), ref, rtol=1e-5, atol=1e-5)
