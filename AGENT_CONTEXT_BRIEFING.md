@@ -37,6 +37,7 @@ Kullanıcı okul laboratuvarında çalışmaktadır. Bugünkü ana hedef:
 * `05_DOKUMANTASYON_VE_RAPORLAR/`: Tüm teknik kitapçıklar, benchmark analizleri ve 44 deneylik maraton raporları.
 * `06_YENI_FIKIR_V_PDM/`: Sıfırdan katman fikri V-PDM spesifikasyonu ve çalışan PyTorch şablonu.
 * `07_BIFROST_CSL/`: Bifrost CSL, üstel dilatasyonlu CSL (`valerois_exponential_csl.py`), CSL-QV5 üç kanallı katman (`valerois_csl_qv5.py`).
+* `08_BIFROST_H/`: **Güncel ana plan** (`PLAN_BIFROST_H.md`): Bifrost CSL v2 + Mímir (düzeltilmiş V-PDM / kapılı delta hafıza) + Heimdall (CSL-Attention) hibriti, cache tasarımı, Bifrost Bench ve faz kapıları. Yeni işe başlamadan önce oku. `tools/audit_causality.py` eski katmanların nedensellik denetimi, `prototypes/mimir_proto.py` chunk-paralel delta kuralı prototipi.
 
 ---
 
