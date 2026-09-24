@@ -21,6 +21,8 @@ python -c "import torch; print(torch.cuda.is_available(), torch.version.hip, tor
 
 ROCm'da PyTorch cihazı yine `cuda` adıyla görür, bu normal. Bellek ve dikkat çekirdeği ortam değişkenlerini `egit.py` kendisi ayarlar.
 
+**Windows + DirectML:** `pip install torch-directml`, sonra komutlara `--device dml` ekle. DirectML'de `torch.compile` ve bf16 kullanılamıyor; eğitim fp32 ve derlemesiz çalışır. Bu yüzden Linux ROCm'a göre birkaç kat yavaştır; ciddi uzun eğitim için ROCm önerilir.
+
 ## Hızlı başlangıç
 
 `GercekMimari/` klasörünün içinden çalıştır. `stream_coder_100k.bin` repo kökünde (`main` dalında) duruyor.
@@ -84,4 +86,8 @@ Log her 10 adımda tok/s, tahmini TFLOPS, VRAM, grad normu yazar. `--peak-tflops
 `stream_coder_100k.bin` 25.6M token. ~100M'lik bir model için azdır: birkaç epoch'a kadar tekrar sorun değil, ama daha fazlası ezberletir. `fineweb_edu_8k.bin`, `master_code_8k.bin` gibi dosyaları ekle ve val loss'u izle (`[val]` satırları).
 
 ## Durum
-Kod bu oturumda CPU'da çalıştırılarak kontrol edildi (ileri/geri geçiş, cache ile üretim, eğitim/üretim/değerlendirme betikleri). ROCm GPU'da henüz denenmedi. İlk koşuda sorun çıkarsa hata çıktısını ilet.
+Kod bu oturumda CPU'da çalıştırılarak kontrol edildi:
+- İleri/geri geçiş ve cache ile üretimin paralel hesapla eşdeğerliği.
+- Uçtan uca zincir: sentetik veri → eğitim → checkpoint → devam → üretim → değerlendirme.
+
+ROCm ve DirectML GPU'da henüz denenmedi. İlk koşuda sorun çıkarsa hata çıktısını ilet.

@@ -56,10 +56,10 @@ def causal_short_conv(x: torch.Tensor, weight: torch.Tensor, prefix: Optional[to
 
 # --------------------------------------------------------------------------- RoPE
 def rope_cos_sin(positions: torch.Tensor, dim: int, base: float, dtype: torch.dtype):
-    """positions: [T] (int). Açılar float64'te: 1M+ pozisyonda da hassas."""
-    inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=positions.device, dtype=torch.float64) / dim))
-    ang = positions.to(torch.float64)[:, None] * inv[None, :]
-    return ang.cos().to(dtype), ang.sin().to(dtype)
+    """positions: [T] (int). Açılar CPU'da float64: 1M+ pozisyonda da hassas; DirectML float64 desteklemez."""
+    inv = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
+    ang = positions.cpu().to(torch.float64)[:, None] * inv[None, :]
+    return ang.cos().to(positions.device, dtype), ang.sin().to(positions.device, dtype)
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

@@ -35,6 +35,7 @@ from pathlib import Path
 import torch
 
 from kuzgun import PRESETS, KuzgunConfig, KuzgunLM
+from kuzgun.cihaz import get_device, is_dml
 from kuzgun.data import DataMixture, Prefetcher
 from kuzgun.optim import build_optimizers, set_lr, wsd
 
@@ -68,7 +69,7 @@ def parse_args():
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--compile-mode", default="default", help="default | max-autotune-no-cudagraphs")
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default=None)
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default=None, help="cuda | dml (Windows DirectML) | cpu; boşsa otomatik")
     p.add_argument("--out", default="kosular/kuzgun")
     p.add_argument("--resume", help="checkpoint yolu (model + optimizer + adım)")
     p.add_argument("--init-from", help="yalnız ağırlıkları yükle (ince ayar)")
@@ -159,8 +160,10 @@ def main() -> None:
     lr_adam = args.lr_adam or preset.lr_adam
 
     torch.manual_seed(args.seed)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = get_device(args.device)
     is_rocm = torch.version.hip is not None
+    if is_dml(device):  # DirectML: torch.compile ve bf16 autocast yok → fp32, derlemesiz
+        args.compile, args.dtype = False, "fp32"
     if args.dtype is None:
         args.dtype = "bf16" if device.type == "cuda" and torch.cuda.is_bf16_supported() else "fp32"
     amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[args.dtype]
@@ -202,7 +205,7 @@ def main() -> None:
     (out_dir / "config.json").write_text(json.dumps({"model": cfg.to_dict(), "args": vars(args)}, indent=2))
     log_file = open(out_dir / "log.jsonl", "a")
 
-    dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
+    dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else ("DirectML" if is_dml(device) else "CPU")
     print(f"Kuzgun | {model.num_params() / 1e6:.1f}M param ({n_dense / 1e6:.1f}M yoğun) | {cfg.n_layers} katman, "
           f"d={cfg.d_model}, {cfg.n_heads} kafa ({cfg.archival_heads} arşiv), pencere {cfg.window}")
     print(f"Cihaz: {dev_name}{' [ROCm ' + torch.version.hip + ']' if is_rocm else ''} | {args.dtype} | "
