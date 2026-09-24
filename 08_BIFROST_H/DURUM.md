@@ -41,6 +41,19 @@ Global dikkat yok. Arşiv kafaları (α ≡ 1) uzun mesafe unutmasını çözer.
 Tanı (`bench/mqar_diagnose.py`, K_coupled, 65K): normal %58.6 → unutma kapalı (α=1) **%96.1**;
 pencere kolu kapalı %58.6 (etkisiz). Öğrenilen α = 0.99997 → α^65536 = 0.12. Sebep: sızıntılı unutma.
 
-## Şu anki iş
-- MQAR: arşiv kafalı Kuzgun ve arşiv kafalı yalnız hafıza (2 kafa × 32, 1 arşiv) — sonuç bekleniyor.
-- Gerçek kod: Kuzgun (6×K, 4 kafa, 2 arşiv) ile Transformer (6×A), eşit 20 dk CPU — sonuç bekleniyor.
+Arşiv kafası düzeltmesi (yalnız hafıza, 2 kafa × 32, 1 arşiv): 256 → 262K boşlukta %94-97 (`results/mqar/R_arch.json`).
+Kuzgun + arşiv kafası koşusu tamamlanmadı.
+
+## Gerçek kod karşılaştırması (CPU, 1 thread, eşit 20 dk, T=512, Muon)
+| Model | Param | Token | Hız | Final val (dev_code / stream_coder, 32 pencere) |
+|---|---|---|---|---|
+| Kuzgun (6×K, 4 kafa, 2 arşiv) | 7.21M | 1.04M | 860 tok/s | 2.881 / 3.106 |
+| Transformer (6×A) | 6.77M | 1.54M | 1.283 tok/s | 2.632 / 2.913 |
+
+- Eşit sürede Transformer önde: CPU'da T=512'de token başına 1.5× hızlı.
+- Eşit tokende (hızlı val, 8 pencere) Kuzgun biraz önde görünüyor (0.91M'de 2.762 vs 0.95M'de 2.855). Ama LR çizelgesi süreye bağlı olduğu için bu kıyas karışık.
+- Kuzgun'un avantajı uzun bağlamda (T ≫ W) ve çıkarım belleğinde. Kısa dizide ve CPU'da hız avantajı yok.
+- Gradyan normları sağlıklı (Kuzgun blokları 0.10-0.49).
+
+## ROCm eğitim sistemi
+`GercekMimari/` (PR: ValeroisAI/Bifrost#1). CPU'da doğrulandı, GPU'da henüz çalıştırılmadı.
