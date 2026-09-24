@@ -12,6 +12,9 @@ egit.py — Kuzgun eğitimi (ROCm / CUDA / CPU)
     # kaldığı yerden devam
     python egit.py --resume kosular/temel/son.pt
 
+    # deneysel: gizli ağırlıksız üçlü eğitim + 2 product-key hafıza katmanı
+    python egit.py --preset temel --uclu --hafiza-katmani 4 8 --data ../stream_coder_100k.bin --tokens 2e9
+
 Tüm ayarlar için:  python egit.py -h
 """
 
@@ -38,6 +41,7 @@ from kuzgun import PRESETS, KuzgunConfig, KuzgunLM
 from kuzgun.cihaz import get_device, is_dml
 from kuzgun.data import DataMixture, Prefetcher
 from kuzgun.optim import build_optimizers, set_lr, wsd
+from kuzgun.uclu import TernaryFlip, int8_available, set_int8, ternary_stats
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_TOKENIZER = HERE.parent / "04_TOKENIZERLAR" / "valerois_tokenizer_8k.json"
@@ -65,6 +69,15 @@ def parse_args():
     p.add_argument("--attn", choices=["sdpa", "flex"], help="pencere dikkati arka ucu")
     p.add_argument("--window", type=int)
     p.add_argument("--archival", type=int, help="unutmayan hafıza kafası sayısı")
+    p.add_argument("--d-model", type=int, help="model genişliği (ön ayarı ezer)")
+    p.add_argument("--n-layers", type=int)
+    p.add_argument("--n-heads", type=int)
+    p.add_argument("--uclu", action="store_true", help="deneysel: gizli ağırlıksız üçlü (−1/0/+1) gizli matrisler")
+    p.add_argument("--uclu-int8", action="store_true", help="üçlü katmanlarda int8 ileri geçiş (destek yoksa bf16)")
+    p.add_argument("--flip-orani", type=float, default=2e-3, help="üçlü: adım başına çevrilen ağırlık oranı (tepe)")
+    p.add_argument("--hafiza-katmani", type=int, nargs="*", help="product-key hafıza eklenecek blok indeksleri")
+    p.add_argument("--hafiza-yuva", type=int, help="alt-anahtar sayısı n (yuva = n²), varsayılan 512")
+    p.add_argument("--lr-hafiza", type=float, help="hafıza değer tablosu öğrenme hızı (varsayılan: AdamW lr)")
     p.add_argument("--compile", dest="compile", action="store_true", default=True)
     p.add_argument("--no-compile", dest="compile", action="store_false")
     p.add_argument("--compile-mode", default="default", help="default | max-autotune-no-cudagraphs")
@@ -146,10 +159,14 @@ def main() -> None:
 
     preset = PRESETS[args.preset]
     cfg: KuzgunConfig = KuzgunConfig(**ckpt["config"]) if ckpt else preset.model
-    overrides = {k: v for k, v in dict(window=args.window, archival_heads=args.archival, attn_backend=args.attn).items()
-                 if v is not None}
-    if args.mtp:
-        overrides["mtp"] = True
+    overrides = {k: v for k, v in dict(window=args.window, archival_heads=args.archival, attn_backend=args.attn,
+                                       d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
+                                       memory_n_sub=args.hafiza_yuva).items() if v is not None}
+    if args.hafiza_katmani:
+        overrides["memory_layers"] = tuple(args.hafiza_katmani)
+    for flag, key in ((args.mtp, "mtp"), (args.uclu, "ternary"), (args.uclu_int8, "ternary_int8")):
+        if flag:
+            overrides[key] = True
     if overrides and not ckpt:
         cfg = replace(cfg, **overrides)
     seq_len = args.seq_len or preset.seq_len
@@ -174,10 +191,19 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     model = KuzgunLM(cfg).to(device)
+    if is_dml(device):
+        model.float()  # üçlü ağırlıklar dahil her şey fp32
     model.grad_ckpt = grad_ckpt
+    if cfg.ternary_int8 and not (device.type == "cuda" and int8_available(device)):
+        print("Uyarı: torch._int_mm bu cihazda yok ya da hatalı; üçlü katmanlar bf16 matmul kullanacak.")
+        set_int8(model, False)
     if args.init_from:
         model.load_state_dict(torch.load(args.init_from, map_location="cpu", weights_only=False)["model"])
-    optimizers = build_optimizers(model, lr_muon, lr_adam, use_muon=not args.adamw_only)
+    optimizers = build_optimizers(model, lr_muon, lr_adam, use_muon=not args.adamw_only,
+                                  flip_rate=args.flip_orani, lr_memory=args.lr_hafiza)
+    flipper = next((o for o in optimizers if isinstance(o, TernaryFlip)), None)
+    clip_params = [p for p in model.parameters()  # üçlü ve seyrek gradyanlar kendi optimizer'larında normalize
+                   if not getattr(p, "ternary", False) and not getattr(p, "sparse_rows", False)]
     step, tokens_seen = 0, 0
     if ckpt:
         model.load_state_dict(ckpt["model"])
@@ -188,7 +214,7 @@ def main() -> None:
     data = DataMixture(args.data, val_frac=args.val_frac, seed=args.seed + step)
     val_batches = data.val_batches(seq_len, args.eval_batches)
     total_steps = max(1, int(args.tokens // batch_tokens))
-    n_dense = model.num_params(non_embedding=True) + model.lm_head.weight.numel()
+    n_dense = model.num_params(non_embedding=True) - model.memory_params() + model.lm_head.weight.numel()
 
     tokenizer = None
     if args.sample_every and Path(args.tokenizer).exists():
@@ -210,6 +236,14 @@ def main() -> None:
           f"d={cfg.d_model}, {cfg.n_heads} kafa ({cfg.archival_heads} arşiv), pencere {cfg.window}")
     print(f"Cihaz: {dev_name}{' [ROCm ' + torch.version.hip + ']' if is_rocm else ''} | {args.dtype} | "
           f"compile={args.compile} | grad_ckpt={grad_ckpt} | MTP={cfg.mtp} | dikkat={cfg.attn_backend}")
+    if cfg.ternary:
+        n3 = ternary_stats(model)["uclu_param"]
+        print(f"Üçlü (gizli ağırlıksız): {n3 / 1e6:.1f}M ağırlık −1/0/+1, flip oranı {args.flip_orani} | "
+              f"int8={any(getattr(m, 'use_int8', False) for m in model.modules())}")
+    if cfg.memory_layers:
+        print(f"Hafıza katmanları {list(cfg.memory_layers)}: {cfg.memory_n_sub ** 2:,} yuva/katman, top-{cfg.memory_topk}"
+              f" × {cfg.memory_heads} kafa | {model.memory_params() / 1e6:.1f}M param (token başına yalnız "
+              f"{cfg.memory_heads * cfg.memory_topk} satır okunur)")
     print(f"Hedef T={seq_len}, mikro-batch {micro_batch}, adım başına {batch_tokens:,} token, "
           f"{total_steps:,} adım ({args.tokens / 1e9:.2f}B token) | Muon {lr_muon} / AdamW {lr_adam}")
     print(f"Veri: {data.describe()}", flush=True)
@@ -259,7 +293,7 @@ def main() -> None:
                     logs_acc[k] = logs_acc.get(k, 0.0) + v.float().item() / accum
             for opt in optimizers:
                 scaler.unscale_(opt)
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             for opt in optimizers:
                 scaler.step(opt)
             scaler.update()
@@ -279,11 +313,16 @@ def main() -> None:
                 mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
                 rec = {"step": step, "tokens": tokens_seen, "seq": cur_t, "lr_factor": wsd(progress, args.warmup, args.decay_start),
                        "grad_norm": float(gnorm), "tok_s": tps, "tflops": tflops, "mem_gb": mem, **logs_acc}
+                extra = ""
+                if flipper is not None:
+                    rec["flip"] = flipper.last_flip_frac
+                    rec["sifir_orani"] = ternary_stats(model)["sifir_orani"]
+                    extra = f" | flip {100 * rec['flip']:.3f}% sıfır {100 * rec['sifir_orani']:.0f}%"
                 mfu = f" | MFU {100 * tflops / args.peak_tflops:4.1f}%" if args.peak_tflops else ""
                 print(f"adım {step:6d}/{total_steps} | loss {logs_acc.get('loss_lm', float('nan')):.4f}"
                       + (f" (mtp {logs_acc['loss_mtp']:.3f})" if "loss_mtp" in logs_acc else "")
                       + f" | T={cur_t} | {tps:,.0f} tok/s | ~{tflops:.1f} TFLOPS{mfu} | grad {float(gnorm):.2f}"
-                      + f" | {mem:.1f} GB | {tokens_seen / 1e6:,.0f}M tok", flush=True)
+                      + f" | {mem:.1f} GB | {tokens_seen / 1e6:,.0f}M tok" + extra, flush=True)
                 log_file.write(json.dumps(rec) + "\n")
                 log_file.flush()
                 t_log, tok_log = time.time(), 0

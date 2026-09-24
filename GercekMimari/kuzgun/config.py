@@ -30,6 +30,13 @@ class KuzgunConfig:
     tie_embeddings: bool = True
     norm_eps: float = 1e-6
     attn_backend: str = "sdpa"     # "sdpa" (her yerde çalışır) | "flex" (torch flex_attention, varsa daha hızlı)
+    ternary: bool = False          # gizli ağırlıksız üçlü (−1/0/+1) doğrusal katmanlar, bkz. uclu.py
+    ternary_int8: bool = False     # üçlü katmanlarda int8 ileri geçiş (torch._int_mm)
+    memory_layers: tuple = ()      # product-key hafıza katmanı eklenecek blok indeksleri, bkz. hafiza.py
+    memory_n_sub: int = 512        # alt-anahtar sayısı n → n² yuva
+    memory_heads: int = 4
+    memory_topk: int = 32
+    memory_dq: int = 256
 
     @property
     def inner(self) -> int:

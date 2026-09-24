@@ -1,7 +1,8 @@
 """
 Kuzgun dil modeli.
 
-Blok:   x ← x + Kuzgun(RMSNorm(x));   x ← x + SwiGLU(RMSNorm(x))
+Blok:   x ← x + Kuzgun(RMSNorm(x));   [x ← x + Hafıza(RMSNorm(x))];   x ← x + SwiGLU(RMSNorm(x))
+        (Hafıza: seçilen bloklarda product-key katmanı. cfg.ternary: gizli matrisler üçlü, bkz. uclu.py)
 
 Kuzgun katmanı (global dikkat yok, çıkarım belleği O(1)):
     [q;k;v] = SiLU(ShortConv(W_qkv x)),  q̂ = q/‖q‖,  k̂ = k/‖k‖       (ortak anahtarlar)
@@ -26,8 +27,17 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import KuzgunConfig
+from .hafiza import ProductKeyMemory
 from .ops import (RMSNorm, apply_rope, causal_short_conv, chunk_gated_delta_rule, gated_delta_step,
                   rope_cos_sin, sliding_window_attention)
+from .uclu import TernaryLinear
+
+
+def make_linear(cfg: KuzgunConfig, d_in: int, d_out: int) -> nn.Module:
+    """Gizli matrisler: yoğun (nn.Linear) ya da gizli ağırlıksız üçlü (TernaryLinear)."""
+    if cfg.ternary:
+        return TernaryLinear(d_in, d_out, use_int8=cfg.ternary_int8)
+    return nn.Linear(d_in, d_out, bias=False)
 
 
 class Kuzgun(nn.Module):
@@ -37,11 +47,11 @@ class Kuzgun(nn.Module):
         d, h, dh = cfg.d_model, cfg.n_heads, cfg.head_dim
         inner = h * dh
         self.h, self.dh, self.inner = h, dh, inner
-        self.qkv = nn.Linear(d, 3 * inner, bias=False)
+        self.qkv = make_linear(cfg, d, 3 * inner)
         self.conv_w = nn.Parameter(torch.zeros(3 * inner, cfg.conv_kernel))
         self.gates = nn.Linear(d, 4 * h, bias=True)       # [unutma a, yazma b, karışım m_H, karışım m_M]
-        self.g_proj = nn.Linear(d, inner, bias=False)
-        self.o_proj = nn.Linear(inner, d, bias=False)
+        self.g_proj = make_linear(cfg, d, inner)
+        self.o_proj = make_linear(cfg, inner, d)
         self.norm_h = RMSNorm(dh, cfg.norm_eps)
         self.norm_m = RMSNorm(dh, cfg.norm_eps)
         self.log_temp = nn.Parameter(torch.full((h,), math.log(math.sqrt(dh))))
@@ -152,10 +162,10 @@ class Kuzgun(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, d: int, hidden: int) -> None:
+    def __init__(self, cfg: KuzgunConfig) -> None:
         super().__init__()
-        self.w12 = nn.Linear(d, 2 * hidden, bias=False)
-        self.w3 = nn.Linear(hidden, d, bias=False)
+        self.w12 = make_linear(cfg, cfg.d_model, 2 * cfg.ffn_hidden)
+        self.w3 = make_linear(cfg, cfg.ffn_hidden, cfg.d_model)
 
     def forward(self, x):
         a, b = self.w12(x).chunk(2, dim=-1)
@@ -163,26 +173,33 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, cfg: KuzgunConfig) -> None:
+    def __init__(self, cfg: KuzgunConfig, idx: int = 0) -> None:
         super().__init__()
         self.norm1 = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mixer = Kuzgun(cfg)
+        self.memory = None
+        if idx in cfg.memory_layers:  # token başına bakılan dev hafıza (cache gerektirmez)
+            self.norm_mem = RMSNorm(cfg.d_model, cfg.norm_eps)
+            self.memory = ProductKeyMemory(cfg.d_model, cfg.memory_n_sub, cfg.memory_heads,
+                                           cfg.memory_topk, cfg.memory_dq)
         self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+        self.ffn = SwiGLU(cfg)
+
+    def _tail(self, x):
+        if self.memory is not None:
+            x = x + self.memory(self.norm_mem(x))
+        return x + self.ffn(self.norm2(x))
 
     def forward(self, x):
-        x = x + self.mixer(self.norm1(x))
-        return x + self.ffn(self.norm2(x))
+        return self._tail(x + self.mixer(self.norm1(x)))
 
     def prefill(self, x, cache):
         y, cache = self.mixer.prefill(self.norm1(x), cache)
-        x = x + y
-        return x + self.ffn(self.norm2(x)), cache
+        return self._tail(x + y), cache
 
     def step(self, x, cache):
         y, cache = self.mixer.step(self.norm1(x), cache)
-        x = x + y
-        return x + self.ffn(self.norm2(x)), cache
+        return self._tail(x + y), cache
 
 
 class KuzgunLM(nn.Module):
@@ -190,15 +207,15 @@ class KuzgunLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
+        self.blocks = nn.ModuleList([Block(cfg, i) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.mtp:
             # t+2 tahmini: [h_t ; emb(x_{t+1})] -> küçük FFN -> ortak LM başı (DeepSeek-V3 MTP'nin hafif hali)
             self.mtp_norm_h = RMSNorm(cfg.d_model, cfg.norm_eps)
             self.mtp_norm_e = RMSNorm(cfg.d_model, cfg.norm_eps)
-            self.mtp_proj = nn.Linear(2 * cfg.d_model, cfg.d_model, bias=False)
-            self.mtp_ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+            self.mtp_proj = make_linear(cfg, 2 * cfg.d_model, cfg.d_model)
+            self.mtp_ffn = SwiGLU(cfg)
             self.mtp_norm = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.grad_ckpt = False
         self._init_weights()
@@ -214,12 +231,19 @@ class KuzgunLM(nn.Module):
             if isinstance(m, Kuzgun):
                 m.reset_conv()
         for name, m in self.named_modules():  # artık dalların çıkışları sıfırdan: derin ağda temiz gradyan
-            if isinstance(m, nn.Linear) and name.endswith(("o_proj", "w3")):
-                nn.init.zeros_(m.weight)
+            if name.endswith(("o_proj", "w3")):
+                if isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight)
+                elif isinstance(m, TernaryLinear):
+                    m.zero_()
 
     def num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
         return n - self.embed.weight.numel() if non_embedding else n
+
+    def memory_params(self) -> int:
+        """Hafıza değer tabloları: parametre çok, token başına hesap küçük (yalnız top-k satır okunur)."""
+        return sum(b.memory.values.weight.numel() for b in self.blocks if b.memory is not None)
 
     def _logits(self, h: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(self.norm(h)).float()
