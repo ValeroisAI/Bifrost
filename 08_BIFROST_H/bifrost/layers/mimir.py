@@ -132,14 +132,22 @@ class Mimir(nn.Module):
         return self.o_proj(o.flatten(-2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, t, _ = x.shape
-        q = F.normalize(self._heads(self.q_conv(self.q_proj(x)), self.dk).float(), dim=-1) / math.sqrt(self.dk)
-        k = F.normalize(self._heads(self.k_conv(self.k_proj(x)), self.dk).float(), dim=-1)
-        v = self._heads(self.v_conv(self.v_proj(x)), self.dv).float()
+        return self.forward_stateful(x, None)[0]
+
+    def forward_stateful(self, x: torch.Tensor, state: Optional[dict]) -> Tuple[torch.Tensor, dict]:
+        """state=None: sıfırdan. Aksi halde önceki parçanın durumu devam ettirilir (prefill)."""
+        if state is None:
+            state = self.init_state(x.size(0), x.device, x.dtype)
+        q, sq = self.q_conv.forward_stateful(self.q_proj(x), state["q"])
+        k, sk = self.k_conv.forward_stateful(self.k_proj(x), state["k"])
+        v, sv = self.v_conv.forward_stateful(self.v_proj(x), state["v"])
+        q = F.normalize(self._heads(q, self.dk).float(), dim=-1) / math.sqrt(self.dk)
+        k = F.normalize(self._heads(k, self.dk).float(), dim=-1)
+        v = self._heads(v, self.dv).float()
         g, beta = self._gates(x)
         tr = lambda z: z.transpose(1, 2)  # [B,T,H,...] -> [B,H,T,...]
-        o, _ = gated_delta_chunk(tr(q), tr(k), tr(v), tr(g), tr(beta), self.chunk_size)
-        return self._output(tr(o).to(x.dtype), x)
+        o, S = gated_delta_chunk(tr(q), tr(k), tr(v), tr(g), tr(beta), self.chunk_size, initial_state=state["S"])
+        return self._output(tr(o).to(x.dtype), x), {"q": sq, "k": sk, "v": sv, "S": S}
 
     def init_state(self, batch: int, device, dtype) -> dict:
         return {

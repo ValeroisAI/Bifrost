@@ -46,6 +46,14 @@ class ShortConv(nn.Module):
     def init_state(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.zeros(batch, self.dim, self.span, device=device, dtype=dtype)
 
+    def forward_stateful(self, x: torch.Tensor, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Parça parça işleme (prefill): önceki parçanın son girdileri dolgu yerine kullanılır."""
+        t = x.size(1)
+        full = torch.cat((state, x.transpose(1, 2)), dim=-1)
+        y = F.conv1d(full, self.weight.to(x.dtype), dilation=self.dilation, groups=self.dim)
+        new_state = full[..., full.size(-1) - self.span:] if self.span else state
+        return self._act(y[..., :t].transpose(1, 2)), new_state
+
     def step(self, x: torch.Tensor, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B, D]; state: [B, D, span] (en eski -> en yeni)
         window = torch.cat((state, x.unsqueeze(-1)), dim=-1)
@@ -69,6 +77,11 @@ class BifrostCSL(nn.Module):
 
     def init_state(self, batch: int, device, dtype) -> dict:
         return {"conv": self.conv.init_state(batch, device, dtype)}
+
+    def forward_stateful(self, x: torch.Tensor, state: dict) -> Tuple[torch.Tensor, dict]:
+        u, g = self.in_proj(x).chunk(2, dim=-1)
+        u, conv_state = self.conv.forward_stateful(u, state["conv"])
+        return self.out_proj(F.silu(g) * u), {"conv": conv_state}
 
     def step(self, x: torch.Tensor, state: dict) -> Tuple[torch.Tensor, dict]:
         u, g = self.in_proj(x).chunk(2, dim=-1)

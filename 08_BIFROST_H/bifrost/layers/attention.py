@@ -71,6 +71,20 @@ class CausalAttention(nn.Module):
         y = self._attend(q, k, v, mask)
         return self.o_proj(y.transpose(1, 2).reshape(b, t, -1))
 
+    def forward_stateful(self, x: torch.Tensor, state: dict) -> Tuple[torch.Tensor, dict]:
+        b, t, _ = x.shape
+        pos = state["pos"]
+        q, k, v = self._qkv(x, torch.arange(pos, pos + t, device=x.device))
+        k = torch.cat((state["k"], k), dim=2)
+        v = torch.cat((state["v"], v), dim=2)
+        i = torch.arange(pos, pos + t, device=x.device)[:, None]
+        j = torch.arange(k.size(2), device=x.device)[None, :] + (pos + t - k.size(2))
+        mask = (j <= i) if self.window is None else (j <= i) & (i - j < self.window)
+        y = self._attend(q, k, v, mask)
+        if self.window is not None:
+            k, v = k[:, :, -self.window:], v[:, :, -self.window:]
+        return self.o_proj(y.transpose(1, 2).reshape(b, t, -1)), {"k": k, "v": v, "pos": pos + t}
+
     def init_state(self, batch: int, device, dtype) -> dict:
         shape = (batch, self.num_kv_heads, 0, self.head_dim)
         return {"k": torch.zeros(shape, device=device, dtype=dtype),
