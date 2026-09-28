@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heimdall-lm"
+version = "1.0.0"
+description = "Heimdall: Gated DeltaNet + seyrek global dikkat hibrit dil modeli, eğitim ve OpenAI uyumlu servis (CUDA / ROCm)"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.4", "numpy", "tokenizers>=0.15"]
+
+[project.optional-dependencies]
+serve = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "safetensors>=0.4", "pydantic>=2"]
+fast = ["flash-linear-attention>=0.2"]
+dev = ["pytest", "httpx"]
+
+[project.scripts]
+heimdall-train = "heimdall.train:main"
+heimdall-serve = "heimdall.server:main"
+heimdall-export = "heimdall.export:main"
+
+[tool.setuptools.packages.find]
+include = ["heimdall*"]

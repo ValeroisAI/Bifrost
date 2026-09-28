@@ -1,0 +1,6 @@
+runs/
+models/
+logs/
+**/__pycache__/
+*.pt
+*.bin

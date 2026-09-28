@@ -1,0 +1,17 @@
+# NVIDIA (CUDA 12.x). Derleme:  docker build -f docker/Dockerfile.cuda -t heimdall:cuda .
+ARG BASE=pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+FROM ${BASE}
+ARG WITH_FLA=1
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY heimdall ./heimdall
+RUN pip install ".[serve]" && \
+    if [ "$WITH_FLA" = "1" ]; then pip install flash-linear-attention || echo "fla kurulamadı: PyTorch çekirdeği kullanılacak"; fi
+RUN useradd -m heimdall && mkdir -p /models /logs && chown heimdall /logs
+USER heimdall
+ENV HEIMDALL_MODEL=/models/heimdall HEIMDALL_USAGE_LOG=/logs/usage.jsonl
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)" || exit 1
+CMD ["python", "-m", "heimdall.server", "--host", "0.0.0.0", "--port", "8000"]
