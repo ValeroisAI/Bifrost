@@ -18,11 +18,12 @@ Eğitim iki aşamalıdır (yalnız yeni parametreler, model boyutunun ~%2'si):
     A) Katman katman: her katman öğretmenin gizli durumlarıyla beslenir, öğretmenin dikkat çıktısını taklit eder.
     B) Uçtan uca: öğretmenin token olasılıklarına KL damıtma.
 
-    python -m heimdall.donustur --model smol --train wiki_train.bin --test wiki_test.bin --out donusum
+    # model ve veri otomatik iner (Hugging Face), GPU varsa bf16 ile GPU'da çalışır:
+    python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --wikitext veri/wikitext --out donusum
 """
 
 import argparse
-import copy
+import contextlib
 import json
 import math
 import time
@@ -111,15 +112,37 @@ class ConvAttention(nn.Module):
     def _full(self, qr, kr, v):
         return F.scaled_dot_product_attention(qr, kr, v.transpose(1, 2), is_causal=True).transpose(1, 2)
 
+    def _window_attn(self, qr, kr, v):
+        """Pencere + çapa softmax dikkati, blok-yerel: bellek O(T·(2W+S)). Döndürür o [B,T,H,D], lse [B,H,T]."""
+        b, h, t, d = qr.shape
+        w, s = self.window, min(self.sinks, t)
+        pad = (-t) % w
+        n = (t + pad) // w
+        vt = v.transpose(1, 2)
+        qb, kb, vb = (F.pad(z.float(), (0, 0, 0, pad)).view(b, h, n, w, d) for z in (qr, kr, vt))
+        prev = lambda z: F.pad(z, (0, 0, 0, 0, 1, 0))[:, :, :-1]
+        sink = lambda z: z[:, :, None, :s].float().expand(b, h, n, s, d)
+        keys = torch.cat((sink(kr), prev(kb), kb), dim=3)                           # [B,H,N,S+2W,D]
+        vals = torch.cat((sink(vt), prev(vb), vb), dim=3)
+        blk = torch.arange(n, device=qr.device)[:, None, None]
+        qpos = blk * w + torch.arange(w, device=qr.device)[None, :, None]           # [N,W,1]
+        j = torch.arange(w, device=qr.device)
+        kpos = torch.cat((torch.arange(s, device=qr.device).expand(n, s),
+                          (blk[:, 0] - 1) * w + j, blk[:, 0] * w + j), dim=1)[:, None, :]   # [N,1,S+2W]
+        is_sink = torch.arange(s + 2 * w, device=qr.device) < s
+        ok = (kpos >= 0) & (kpos <= qpos) & (is_sink | ((qpos - kpos < w) & (kpos >= s)))
+        scores = (qb @ keys.transpose(-1, -2)) * self.dh ** -0.5
+        scores = scores.masked_fill(~ok, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        o = torch.exp(scores - lse[..., None]) @ vals
+        o = o.reshape(b, h, n * w, d)[:, :, :t].transpose(1, 2)
+        return o, lse.reshape(b, h, n * w)[:, :, :t]
+
     def _hybrid(self, x, q, k, v, qr, kr, memory: bool = True):
         b, t = x.shape[:2]
         w, s = self.window, self.sinks
         i = torch.arange(t, device=x.device)
-        allowed = (i[None] <= i[:, None]) & ((i[:, None] - i[None] < w) | (i[None] < s))
-        scores = (qr.float() @ kr.float().transpose(-1, -2)) * self.dh ** -0.5
-        scores = scores.masked_fill(~allowed, float("-inf"))
-        lse = torch.logsumexp(scores, dim=-1)                                        # [B,H,T]
-        o_win = (torch.exp(scores - lse[..., None]) @ v.transpose(1, 2).float()).transpose(1, 2)   # [B,T,H,D]
+        o_win, lse = self._window_attn(qr, kr, v)
         if not memory or t <= w:
             return o_win
         qm = F.normalize(torch.einsum("bthd,hde->bthe", q.float(), self.fq), dim=-1) * self.dh ** -0.5
@@ -225,7 +248,7 @@ def eval_windows(path, t: int, n: int, sep: int):
 @torch.no_grad()
 def evaluate(model, wins, mode: str, buckets):
     model.set_mode(mode)
-    nll = torch.zeros(wins.size(1) - 1)
+    nll = torch.zeros(wins.size(1) - 1, device=wins.device)
     for w in wins:
         logits = model(w[None, :-1])
         nll += F.cross_entropy(logits[0], w[1:], reduction="none")
@@ -236,11 +259,52 @@ def evaluate(model, wins, mode: str, buckets):
     return out
 
 
+def fetch_model(name: str) -> str:
+    if Path(name).exists():
+        return name
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo_id=name, allow_patterns=["*.json", "*.safetensors"])
+
+
+def prepare_wikitext(model_dir: str, out_dir: str, train_tokens: int = 20_000_000, sep: int = 0):
+    """wikitext-103'ü indirip öğretmenin tokenizer'ıyla .bin dosyalarına çevirir (makaleler sep ile ayrılır)."""
+    import re
+
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    files = {"test": ["test-00000-of-00001"], "train": ["train-00000-of-00002", "train-00001-of-00002"]}
+    if all((out / f"wiki_{k}.bin").exists() for k in files):
+        return str(out / "wiki_train.bin"), str(out / "wiki_test.bin")
+    tok = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+    for split, names in files.items():
+        ids = []
+        for name in names:
+            path = hf_hub_download("Salesforce/wikitext", f"wikitext-103-raw-v1/{name}.parquet", repo_type="dataset")
+            cur = []
+            for line in pq.read_table(path).column("text").to_pylist() + [" = END = \n"]:
+                if re.match(r"^ = [^=].* = \n$", line) and cur:
+                    ids.extend(tok.encode("".join(cur)).ids + [sep])
+                    cur = []
+                cur.append(line)
+            if split == "train" and len(ids) >= train_tokens:
+                break
+        np.array(ids, dtype=np.uint16 if tok.get_vocab_size() < 65536 else np.uint32).tofile(out / f"wiki_{split}.bin")
+        print(f"wikitext {split}: {len(ids):,} token", flush=True)
+    return str(out / "wiki_train.bin"), str(out / "wiki_test.bin")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True, help="HF model klasörü (config.json + *.safetensors)")
-    p.add_argument("--train", required=True)
-    p.add_argument("--test", required=True)
+    p.add_argument("--model", required=True, help="HF model klasörü ya da HF adı (ör. HuggingFaceTB/SmolLM2-135M)")
+    p.add_argument("--train", help="eğitim .bin (öğretmen tokenizer'ı)")
+    p.add_argument("--test", help="test .bin (makaleler --sep ile ayrılmış)")
+    p.add_argument("--wikitext", help="wikitext-103'ü bu klasöre hazırla ve kullan")
+    p.add_argument("--wikitext-tokens", type=float, default=20e6)
+    p.add_argument("--device", default=None, help="cuda (ROCm dahil) | cpu; boşsa otomatik")
     p.add_argument("--out", default="donusum")
     p.add_argument("--window", type=int, default=64)
     p.add_argument("--sinks", type=int, default=4)
@@ -262,13 +326,25 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    args.model = fetch_model(args.model)
+    if args.wikitext:
+        args.train, args.test = prepare_wikitext(args.model, args.wikitext, int(args.wikitext_tokens), args.sep)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    gpu = device.type == "cuda"
+    amp = torch.autocast("cuda", dtype=torch.bfloat16) if gpu else contextlib.nullcontext()
+
     model = ConvLM.from_pretrained(args.model)
     model.convert(args.window, args.sinks, args.archival_frac, set(args.keep_global))
     for q in model.parameters():
         q.requires_grad_(False)
     params = model.new_params()
+    new_ids = {id(q) for q in params}
+    for q in model.parameters():
+        if gpu and id(q) not in new_ids:
+            q.data = q.data.to(torch.bfloat16)   # donmuş öğretmen ağırlıkları bf16: yarı bellek, hızlı matmul
     for q in params:
         q.requires_grad_(True)
+    model.to(device)
     n_new = sum(q.numel() for q in params)
     tc = model.tc
     kv_teacher = lambda n: tc.n_layers * 2 * tc.n_kv * tc.head_dim * n * 2
@@ -279,21 +355,22 @@ def main() -> None:
           f"{kv_teacher(8192) / 2**20:.0f} MB, 1M'de {kv_teacher(2**20) / 2**30:.1f} GB → dönüşüm {state / 2**20:.1f} MB (sabit)",
           flush=True)
 
-    wins = eval_windows(args.test, args.eval_len, args.eval_n, args.sep)
+    wins = eval_windows(args.test, args.eval_len, args.eval_n, args.sep).to(device)
     L = args.eval_len
-    buckets = [(0, args.window), (args.window, 256), (256, 1024), (1024, L)]
-    data = np.memmap(args.train, dtype=np.uint16, mode="r")
+    buckets = [(a, min(b, L)) for a, b in ((0, args.window), (args.window, 256), (256, 1024), (1024, L)) if a < min(b, L)]
+    data = np.memmap(args.train, dtype=np.uint16 if model.tc.vocab < 65536 else np.uint32, mode="r")
     rng = np.random.default_rng(0)
 
     def batch():
         s = rng.integers(0, len(data) - args.seq_len - 1, args.batch)
-        return torch.from_numpy(np.stack([data[i:i + args.seq_len] for i in s]).astype(np.int64))
+        return torch.from_numpy(np.stack([data[i:i + args.seq_len] for i in s]).astype(np.int64)).to(device)
 
     results = {"args": vars(args), "eval_windows": int(wins.size(0))}
     t0 = time.time()
-    results["ogretmen"] = evaluate(model, wins, "teacher", buckets)
-    results["yalniz_pencere"] = evaluate(model, wins, "window", buckets)
-    results["donusum_egitimsiz"] = evaluate(model, wins, "student", buckets)
+    with amp:
+        results["ogretmen"] = evaluate(model, wins, "teacher", buckets)
+        results["yalniz_pencere"] = evaluate(model, wins, "window", buckets)
+        results["donusum_egitimsiz"] = evaluate(model, wins, "student", buckets)
     for k in ("ogretmen", "yalniz_pencere", "donusum_egitimsiz"):
         print(f"{k:22s} " + " | ".join(f"{b}: {v:.2f}" for b, v in results[k].items()), flush=True)
 
@@ -306,16 +383,17 @@ def main() -> None:
             for g in opt.param_groups:  # kosinüs düşüş
                 g["lr"] = args.lr * 0.5 * (1 + math.cos(math.pi * step / steps))
             x = batch()
-            if stage == "A":
-                model(x)
-                loss = model.aux_loss()
-            else:
-                with torch.no_grad():
-                    model.set_mode("teacher")
-                    t_logp = F.log_softmax(model(x), dim=-1)
-                    model.set_mode("student")
-                s_logp = F.log_softmax(model(x), dim=-1)
-                loss = F.kl_div(s_logp, t_logp, log_target=True, reduction="batchmean") / x.size(1)
+            with amp:
+                if stage == "A":
+                    model(x)
+                    loss = model.aux_loss()
+                else:
+                    with torch.no_grad():
+                        model.set_mode("teacher")
+                        t_logp = F.log_softmax(model(x), dim=-1)
+                        model.set_mode("student")
+                    s_logp = F.log_softmax(model(x), dim=-1)
+                    loss = F.kl_div(s_logp, t_logp, log_target=True, reduction="batchmean") / x.size(1)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
@@ -325,7 +403,8 @@ def main() -> None:
                       f"{step * x.numel() / (time.time() - t0):,.0f} tok/s", flush=True)
         t0 = time.time()
         key = f"donusum_asama_{stage}"
-        results[key] = evaluate(model, wins, "student", buckets)
+        with amp:
+            results[key] = evaluate(model, wins, "student", buckets)
         results[key]["egitim_token"] = (args.steps_a + (args.steps_b if stage == "B" else 0)) * args.batch * args.seq_len
         print(f"{key:22s} " + " | ".join(f"{b}: {v:.2f}" for b, v in results[key].items()), flush=True)
         (out / "sonuc.json").write_text(json.dumps(results, indent=2))
