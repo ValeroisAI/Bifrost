@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kernels import RMSNorm, delta_rule, rope
+from .kernels import RMSNorm, delta_rule, delta_rule_step, rope
 
 
 class TeacherConfig:
@@ -95,7 +95,7 @@ class ConvAttention(nn.Module):
         return [p for n, p in self.named_parameters() if not n.startswith(("q_proj", "k_proj", "v_proj", "o_proj",
                                                                            "q_norm", "k_norm"))]
 
-    def _qkv(self, x):
+    def _qkv(self, x, start: int = 0):
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.h, self.dh)
         k = self.k_proj(x).view(b, t, self.hkv, self.dh)
@@ -104,7 +104,7 @@ class ConvAttention(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
         rep = self.h // self.hkv
         k, v = k.repeat_interleave(rep, dim=2), v.repeat_interleave(rep, dim=2)
-        pos = torch.arange(t, device=x.device)
+        pos = torch.arange(start, start + t, device=x.device)
         qr = rope(q.transpose(1, 2), pos, self.tc.rope_theta)
         kr = rope(k.transpose(1, 2), pos, self.tc.rope_theta)
         return q, k, v, qr, kr
@@ -138,26 +138,100 @@ class ConvAttention(nn.Module):
         o = o.reshape(b, h, n * w, d)[:, :, :t].transpose(1, 2)
         return o, lse.reshape(b, h, n * w)[:, :, :t]
 
-    def _hybrid(self, x, q, k, v, qr, kr, memory: bool = True):
-        b, t = x.shape[:2]
-        w, s = self.window, self.sinks
-        i = torch.arange(t, device=x.device)
-        o_win, lse = self._window_attn(qr, kr, v)
-        if not memory or t <= w:
-            return o_win
+    def _mem_inputs(self, x, q, k, start: int = 0):
+        t = x.size(1)
+        i = torch.arange(start, start + t, device=x.device)
         qm = F.normalize(torch.einsum("bthd,hde->bthe", q.float(), self.fq), dim=-1) * self.dh ** -0.5
         km = F.normalize(torch.einsum("bthd,hde->bthe", k.float(), self.fk), dim=-1)
         a, bb = self.ab(x).float().chunk(2, dim=-1)
         g = -self.A_log.exp() * F.softplus(a + self.dt_bias) * self.decay_mask
-        beta = torch.sigmoid(bb) * (i >= s).float()[None, :, None]                  # çapa tokenler yazılmaz
+        beta = torch.sigmoid(bb) * (i >= self.sinks).float()[None, :, None]         # çapa tokenler yazılmaz
+        return qm, km, g, beta
+
+    def _hybrid(self, x, q, k, v, qr, kr, memory: bool = True, cache=None):
+        b, t = x.shape[:2]
+        w = self.window
+        i = torch.arange(t, device=x.device)
+        o_win, lse = self._window_attn(qr, kr, v)
+        if cache is None and (not memory or t <= w):
+            return o_win
+        qm, km, g, beta = self._mem_inputs(x, q, k)
         shift = lambda z: F.pad(z, (0, 0) * (z.dim() - 2) + (w, 0))[:, :t]           # j, t = j + W'de yazılır
-        o_mem, _ = delta_rule(qm, shift(km), shift(v.float()), shift(g), shift(beta), 64, backend="torch")
+        o_mem, S = delta_rule(qm, shift(km), shift(v.float()), shift(g), shift(beta), 64, backend="torch")
+        if cache is not None:  # prefill: halka, çapa ve hafıza durumunu doldur
+            self._fill_cache(cache, kr, v, km, g, beta, S)
         gamma = torch.sigmoid(self.mix(x).float() + self.mix_lse * (lse.transpose(1, 2) - math.log(w)))
         gamma = gamma * (i >= w).float()[None, :, None]
         return o_win + gamma[..., None] * (self.mem_scale[:, None] * o_mem - o_win)
 
-    def forward(self, x):
+    # ------------------------------------------------------------------ sabit bellekli çıkarım
+    def _fill_cache(self, c, kr, v, km, g, beta, S):
+        b, h, t, d = kr.shape
+        w, s = self.window, self.sinks
+        dev = kr.device
+        c.update(kind="ring", S=S,
+                 ring_k=kr.new_zeros(b, h, w, d), ring_v=kr.new_zeros(b, h, w, d),
+                 ring_km=km.new_zeros(b, w, h, d), ring_g=g.new_zeros(b, w, h), ring_beta=beta.new_zeros(b, w, h),
+                 ring_pos=torch.full((w,), -1, device=dev, dtype=torch.long),
+                 sink_k=kr[:, :, :s].clone(), sink_v=v.transpose(1, 2)[:, :, :s].clone())
+        m = min(t, w)
+        pos = torch.arange(t - m, t, device=dev)
+        slot = pos % w
+        c["ring_k"][:, :, slot] = kr[:, :, -m:]
+        c["ring_v"][:, :, slot] = v.transpose(1, 2)[:, :, -m:].to(kr.dtype)
+        c["ring_km"][:, slot], c["ring_g"][:, slot], c["ring_beta"][:, slot] = km[:, -m:], g[:, -m:], beta[:, -m:]
+        c["ring_pos"][slot] = pos
+
+    def _step(self, x, c, t: int):
+        """Tek token (konum t). Bellek ve iş, bağlam uzunluğundan bağımsız."""
+        w, s = self.window, self.sinks
+        q, k, v, qr, kr = self._qkv(x, start=t)
+        qm, km, g, beta = self._mem_inputs(x, q, k, start=t)
+        slot = t % w
+        o_mem = None
+        if t >= w:  # pencereden çıkan token (t − W) şimdi hafızaya yazılır, sonra okunur
+            o_mem, c["S"] = delta_rule_step(qm[:, 0], c["ring_km"][:, slot], c["ring_v"][:, :, slot],
+                                            c["ring_g"][:, slot], c["ring_beta"][:, slot], c["S"])
+        c["ring_k"][:, :, slot], c["ring_v"][:, :, slot] = kr[:, :, 0], v[:, 0].to(kr.dtype)
+        c["ring_km"][:, slot], c["ring_g"][:, slot], c["ring_beta"][:, slot] = km[:, 0], g[:, 0], beta[:, 0]
+        c["ring_pos"][slot] = t
+        if t < s:
+            c["sink_k"] = torch.cat((c["sink_k"], kr), 2)
+            c["sink_v"] = torch.cat((c["sink_v"], v.transpose(1, 2).to(kr.dtype)), 2)
+        rp = c["ring_pos"]
+        ok = torch.cat((torch.ones(c["sink_k"].size(2), dtype=torch.bool, device=x.device),
+                        (rp >= s) & (t - rp < w)))
+        keys = torch.cat((c["sink_k"], c["ring_k"]), 2).float()
+        vals = torch.cat((c["sink_v"], c["ring_v"]), 2).float()
+        scores = ((qr.float() @ keys.transpose(-1, -2)) * self.dh ** -0.5).masked_fill(~ok, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)                                        # [B,H,1]
+        o = (torch.exp(scores - lse[..., None]) @ vals).transpose(1, 2)              # [B,1,H,D]
+        if o_mem is not None:
+            gamma = torch.sigmoid(self.mix(x).float() + self.mix_lse * (lse.transpose(1, 2) - math.log(w)))
+            o = o + gamma[..., None] * (self.mem_scale[:, None] * o_mem[:, None] - o)
+        return o
+
+    def _full_cached(self, x, c, start: int):
+        q, k, v, qr, kr = self._qkv(x, start=start)
+        vt = v.transpose(1, 2)
+        if start == 0:
+            c.update(kind="full", k=kr, v=vt)
+            return self._full(qr, kr, v)
+        c["k"], c["v"] = torch.cat((c["k"], kr), 2), torch.cat((c["v"], vt), 2)
+        return F.scaled_dot_product_attention(qr, c["k"], c["v"]).transpose(1, 2)
+
+    def forward(self, x, cache=None, start: int = 0):
         b, t, _ = x.shape
+        if cache is not None:
+            if not self.converted or self.mode == "teacher":
+                o = self._full_cached(x, cache, start)
+            elif start == 0:
+                q, k, v, qr, kr = self._qkv(x)
+                o = self._hybrid(x, q, k, v, qr, kr, cache=cache)
+            else:
+                assert t == 1, "dönüşüm cache'i: prefill tek parça, sonra token token"
+                o = self._step(x, cache, start)
+            return self.o_proj(o.reshape(b, t, -1).to(x.dtype))
         q, k, v, qr, kr = self._qkv(x)
         if not self.converted or self.mode == "teacher":
             o = self._full(qr, kr, v)
@@ -181,8 +255,8 @@ class Layer(nn.Module):
         self.up_proj = nn.Linear(tc.d, tc.inter, bias=False)
         self.down_proj = nn.Linear(tc.inter, tc.d, bias=False)
 
-    def forward(self, x):
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(self, x, cache=None, start: int = 0):
+        x = x + self.self_attn(self.input_layernorm(x), cache, start)
         h = self.post_attention_layernorm(x)
         return x + self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h))
 
@@ -224,11 +298,59 @@ class ConvLM(nn.Module):
     def new_params(self):
         return [p for layer in self.layers if layer.self_attn.converted for p in layer.self_attn.new_params()]
 
-    def forward(self, ids):
+    def forward(self, ids, cache=None, last_only: bool = False):
+        """cache=None: tam dizi. cache verilirse: ilk çağrı prefill, sonrakiler tek token (sabit bellek)."""
         x = self.embed_tokens(ids)
-        for layer in self.layers:
-            x = layer(x)
+        start = cache["pos"] if cache is not None else 0
+        for i, layer in enumerate(self.layers):
+            x = layer(x, None if cache is None else cache["layers"][i], start)
+        if cache is not None:
+            cache["pos"] += ids.size(1)
+        if last_only:
+            x = x[:, -1:]
         return self.lm_head(self.norm(x)).float()
+
+    def new_cache(self) -> dict:
+        return {"pos": 0, "layers": [{} for _ in self.layers]}
+
+    @staticmethod
+    def cache_bytes(cache) -> int:
+        return sum(v.numel() * v.element_size() for c in cache["layers"] for v in c.values() if torch.is_tensor(v))
+
+    @torch.no_grad()
+    def generate(self, ids, max_new: int = 32, stop=None):
+        """Açgözlü üretim. ids: [1, T]. Döndürür (yeni tokenler, cache)."""
+        cache = self.new_cache()
+        logits = self(ids, cache, last_only=True)
+        out = []
+        for _ in range(max_new):
+            nxt = int(logits[0, -1].argmax())
+            if stop is not None and nxt == stop:
+                break
+            out.append(nxt)
+            logits = self(torch.tensor([[nxt]], device=ids.device), cache)
+        return out, cache
+
+    def save_conversion(self, path, meta=None) -> None:
+        conv = [dict(i=i, window=l.self_attn.window, sinks=l.self_attn.sinks,
+                     archival=int((l.self_attn.decay_mask == 0).sum())) for i, l in enumerate(self.layers)
+                if l.self_attn.converted]
+        torch.save({"conv": conv, "params": {n: q.detach().cpu() for n, q in self.named_parameters()
+                                             if any(n.startswith(f"layers.{c['i']}.self_attn.") for c in conv)
+                                             and not n.split(".")[-2].endswith(("_proj", "_norm"))},
+                    "meta": meta or {}}, path)
+
+    @classmethod
+    def load_converted(cls, model_dir, conv_path) -> "ConvLM":
+        model = cls.from_pretrained(model_dir)
+        ck = torch.load(conv_path, map_location="cpu", weights_only=False)
+        for c in ck["conv"]:
+            model.layers[c["i"]].self_attn.convert(c["window"], c["sinks"], c["archival"])
+        missing = [n for n in ck["params"] if n not in dict(model.named_parameters())]
+        assert not missing, missing
+        model.load_state_dict(ck["params"], strict=False)
+        model.set_mode("student")
+        return model
 
     def aux_loss(self):
         auxes = [l.self_attn.aux for l in self.layers if l.self_attn.aux is not None]
@@ -408,7 +530,7 @@ def main() -> None:
         results[key]["egitim_token"] = (args.steps_a + (args.steps_b if stage == "B" else 0)) * args.batch * args.seq_len
         print(f"{key:22s} " + " | ".join(f"{b}: {v:.2f}" for b, v in results[key].items()), flush=True)
         (out / "sonuc.json").write_text(json.dumps(results, indent=2))
-    torch.save({n: q for n, q in model.named_parameters() if q.requires_grad}, out / "donusum_param.pt")
+    model.save_conversion(out / "donusum_param.pt", {"model": args.model, "results": results})
     print(f"Kaydedildi: {out}", flush=True)
 
 

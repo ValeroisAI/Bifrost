@@ -212,3 +212,40 @@ for chunk in client.chat.completions.create(model="heimdall", stream=True,
 - **Sayfalı KV cache yok.** Global dikkat cache'i dizi başına büyür; hibritte bu Transformer'ın ~1/12'si olduğu için pratikte sınır `--max-batch × --max-context`.
 - **Nicemlenmiş servis yok** (int8/fp8).
 - `flash-linear-attention` çağrı biçimi sürümler arasında değişebilir. Açılış testi uyumsuzluğu yakalar ve PyTorch yoluna döner; o durumda eğitim daha yavaş olur ama doğru kalır.
+
+---
+
+## 7. Bifrost dönüşümü: hazır Transformer → sabit bellekli model
+
+Açık bir modelin (Llama, Qwen2/3, SmolLM) her dikkat katmanı şu hale getirilir. Öğretmenin q/k/v/o ağırlıkları aynen kalır; yalnız ~%2'lik yeni parametre eğitilir.
+- **Birebir pencere:** son W token + ilk 4 çapa token için öğretmenin kendi dikkati. Kısa görevler tamamen pencereye sığar ve öğretmenle birebir aynı sonucu verir.
+- **Gecikmeli yazılan delta hafıza:** her token pencereden çıktığı anda hafızaya yazılır; pencere ve hafıza çakışmaz.
+- **Arşiv kafaları (α ≡ 1)** ve pencere içi log-normalizöre bakan **kütle kapısı**.
+- Katman başına bellek sabittir: W + 4 anahtar ve bir d×d matris.
+
+```bash
+# 1) Dönüştür (model ve wikitext otomatik iner). Katman taklidi → uçtan uca damıtma.
+python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --wikitext veri/wikitext \
+    --out kosular/smol135 --window 64 --seq-len 2048 --batch 2 --steps-a 500 --steps-b 1000 --eval-len 4096 --eval-n 32
+# 2) Benchmark (pip install lm-eval). --conv olmadan orijinal model ölçülür.
+python -m heimdall.bifrost_eval lmeval --model HuggingFaceTB/SmolLM2-135M --conv kosular/smol135/donusum_param.pt \
+    --tasks arc_easy,hellaswag,piqa
+# 3) Uzun bağlam: şifre bulma testi (1.7B+ modellerde anlamlı)
+python -m heimdall.bifrost_eval sifre --model ... --conv ... --lengths 4000 16000 64000
+```
+
+Doğrulananlar (CPU, `tests/test_bifrost.py`):
+- Öğretmen uygulaması `transformers` çıktısıyla birebir aynı.
+- Sabit bellekli token token üretim, tam paralel hesapla birebir aynı.
+- Dönüştürülen katman belleği bağlam uzunluğundan bağımsız.
+
+İlk ölçümler (SmolLM2-135M, pencere 64):
+
+| | ppl (wikitext, 2K bağlam) | ARC-Easy (40 soru) |
+|---|---|---|
+| Öğretmen | 13.09 | %52.5 |
+| Yalnız pencere | 23.66 | – |
+| Dönüşüm, eğitimsiz | 24.52 | %52.5 |
+| Dönüşüm, katman taklidi sonrası (300K token, CPU) | 21.25 | – |
+
+Uzun bağlam kalitesi henüz öğretmene ulaşmadı; uçtan uca damıtma GPU'da koşulacak. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
