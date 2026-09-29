@@ -251,4 +251,10 @@ Doğrulananlar (CPU, `tests/test_bifrost.py`):
 | Dönüşüm, eğitimsiz | 24.52 | %52.5 |
 | Dönüşüm, katman taklidi sonrası (300K token, CPU) | 21.25 | – |
 
+**Büyük modeller (`--q4`):** Donuk öğretmen matrisleri 4-bit tutulur (32'lik gruplar, asimetrik, kırpma aramalı). En hassas matrisler (v_proj, down_proj) llama.cpp'nin Q4_K_M ayarı gibi 8-bit kalır; `--hassas-bit 4` hepsini 4-bit yapar. Ağırlıklar tensör tensör yüklenir, RAM'de tam kopya oluşmaz. Qwen3-0.6B'de ölçüm (wikitext): bf16 ppl 13.88 / 840 MB → karışık 4/8-bit 14.90 / 318 MB → tamamı 4-bit 16.26 / 262 MB. Büyük modellerde nicemleme kaybı küçülür. Tahmini VRAM: Qwen3-8B karışık ~7 GB, Qwen3-14B tamamı 4-bit ~10 GB.
+
+```bash
+python -m heimdall.donustur --model Qwen/Qwen3-8B --q4 --wikitext veri/wikitext --out kosular/qwen3_8b --window 1024 --seq-len 2048 --batch 1
+```
+
 Uzun bağlam kalitesi henüz öğretmene ulaşmadı; uçtan uca damıtma GPU'da koşulacak. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.

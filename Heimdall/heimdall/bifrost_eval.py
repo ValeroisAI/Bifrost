@@ -22,13 +22,13 @@ from .donustur import ConvLM, fetch_model
 FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
 
 
-def load(model_name, conv=None, mode=None, device=None):
+def load(model_name, conv=None, mode=None, device=None, q4=False):
     from pathlib import Path
 
     from tokenizers import Tokenizer
 
     path = fetch_model(model_name)
-    model = ConvLM.load_converted(path, conv) if conv else ConvLM.from_pretrained(path)
+    model = ConvLM.load_converted(path, conv, q4) if conv else ConvLM.from_pretrained(path, q4=q4)
     if mode:
         model.set_mode(mode)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -55,7 +55,7 @@ def passkey(model, tok, dev, length: int, depth: float, seed: int):
 
 
 def run_passkey(args) -> None:
-    model, tok, dev = load(args.model, args.conv, args.mode, args.device)
+    model, tok, dev = load(args.model, args.conv, args.mode, args.device, args.q4)
     res = []
     for length in args.lengths:
         for depth in args.depths:
@@ -131,7 +131,7 @@ def make_lm(model, tok, dev, max_len: int = 4096):
 def run_lmeval(args) -> None:
     import lm_eval
 
-    model, tok, dev = load(args.model, args.conv, args.mode, args.device)
+    model, tok, dev = load(args.model, args.conv, args.mode, args.device, args.q4)
     res = lm_eval.simple_evaluate(model=make_lm(model, tok, dev, args.max_len), tasks=args.tasks.split(","),
                                   limit=args.limit, num_fewshot=args.fewshot)
     table = {t: {k: v for k, v in r.items() if isinstance(v, (int, float))} for t, r in res["results"].items()}
@@ -150,6 +150,7 @@ def main() -> None:
         a.add_argument("--mode", choices=["student", "window", "teacher"])
         a.add_argument("--device")
         a.add_argument("--out")
+        a.add_argument("--q4", action="store_true", help="öğretmen matrisleri 4-bit")
         if name == "sifre":
             a.add_argument("--lengths", type=int, nargs="+", default=[1000, 4000, 16000])
             a.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5])

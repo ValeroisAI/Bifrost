@@ -55,6 +55,53 @@ class TeacherConfig:
             raise NotImplementedError("rope_scaling henüz desteklenmiyor")
 
 
+class Q4Linear(nn.Module):
+    """Donuk nicemlenmiş doğrusal katman (4 ya da 8 bit). 32'lik gruplar, grup başına fp16 ölçek + sıfır noktası
+    (asimetrik); her grup için en düşük hatayı veren kırpma oranı aranır. Çarpımdan önce açılır."""
+
+    CLIPS = (1.0, 0.95, 0.9, 0.85, 0.8, 0.7)
+
+    def __init__(self, weight: torch.Tensor, group: int = 32, rows: int = 2048, bits: int = 4) -> None:
+        super().__init__()
+        out_f, in_f = weight.shape
+        assert in_f % group == 0, (in_f, group)
+        packed, scales, zeros = [], [], []
+        top = 2 ** bits - 1
+        self.bits = bits
+        for r in range(0, out_f, rows):  # satır parçaları: büyük matrislerde bellek tepe noktası küçük kalır
+            w = weight[r:r + rows].float().view(-1, in_f // group, group)
+            wmax, wmin = w.amax(-1, keepdim=True), w.amin(-1, keepdim=True)
+            best_err = best_s = best_z = None
+            for c in self.CLIPS:
+                sc = ((wmax - wmin) * c / top).clamp(min=1e-8)
+                z = wmin * c
+                err = ((((w - z) / sc).round().clamp(0, top) * sc + z - w) ** 2).sum(-1, keepdim=True)
+                if best_err is None:
+                    best_err, best_s, best_z = err, sc, z
+                else:
+                    better = err < best_err
+                    best_err = torch.where(better, err, best_err)
+                    best_s, best_z = torch.where(better, sc, best_s), torch.where(better, z, best_z)
+            q = ((w - best_z) / best_s).round().clamp(0, top).to(torch.uint8).view(w.size(0), in_f)
+            packed.append(q[:, 0::2] | (q[:, 1::2] << 4) if bits == 4 else q)
+            scales.append(best_s.squeeze(-1).half())
+            zeros.append(best_z.squeeze(-1).half())
+        self.register_buffer("packed", torch.cat(packed))                           # [out, in/2]
+        self.register_buffer("scale", torch.cat(scales))                            # [out, in/group]
+        self.register_buffer("zero", torch.cat(zeros))
+        self.in_features, self.out_features, self.group = in_f, out_f, group
+        self.bias = None
+
+    def dequant(self, dtype) -> torch.Tensor:
+        q = torch.stack((self.packed & 15, self.packed >> 4), -1) if self.bits == 4 else self.packed
+        q = q.view(self.out_features, -1, self.group).to(dtype)
+        return (q * self.scale.to(dtype)[..., None] + self.zero.to(dtype)[..., None]).view(
+            self.out_features, self.in_features)
+
+    def forward(self, x):
+        return F.linear(x, self.dequant(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
+
+
 class ConvAttention(nn.Module):
     def __init__(self, tc: TeacherConfig) -> None:
         super().__init__()
@@ -273,18 +320,49 @@ class ConvLM(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
 
     @classmethod
-    def from_pretrained(cls, path) -> "ConvLM":
-        from safetensors.torch import load_file
+    def from_pretrained(cls, path, q4: bool = False, group: int = 32, sensitive_bits: int = 8) -> "ConvLM":
+        """HF ağırlıklarını tensör tensör yükler (tam fp32 kopya oluşmaz). q4: katman matrisleri 4-bit tutulur."""
+        from safetensors import safe_open
         p = Path(path)
-        model = cls(TeacherConfig(json.loads((p / "config.json").read_text())))
-        state = {}
+        with torch.device("meta"):
+            model = cls(TeacherConfig(json.loads((p / "config.json").read_text())))
+        mods = dict(model.named_modules())
+        biases = {}
         for f in sorted(p.glob("*.safetensors")):
-            for k, v in load_file(str(f)).items():
-                state[k.removeprefix("model.").replace("mlp.", "")] = v.float()
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        missing = [m for m in missing if not (model.tc.tie and m == "lm_head.weight")]
-        assert not missing and not unexpected, (missing, unexpected)
+            with safe_open(str(f), framework="pt") as fh:
+                for key in fh.keys():
+                    name = key.removeprefix("model.").replace("mlp.", "")
+                    mod_name, attr = name.rsplit(".", 1)
+                    if mod_name not in mods:
+                        raise KeyError(f"beklenmeyen ağırlık: {key}")
+                    t = fh.get_tensor(key)
+                    mod = mods[mod_name]
+                    quant = q4 and isinstance(mod, nn.Linear) and (mod_name.startswith("layers.") or
+                                                                  (mod_name == "lm_head" and not model.tc.tie))
+                    if quant and attr == "weight":
+                        # Q4_K_M gibi: en hassas matrisler (v_proj, down_proj) daha yüksek bitte
+                        bits = sensitive_bits if mod_name.endswith(("v_proj", "down_proj")) else 4
+                        q = Q4Linear(t, group, bits=bits)
+                        parent, child = mod_name.rsplit(".", 1) if "." in mod_name else ("", mod_name)
+                        setattr(mods[parent] if parent else model, child, q)
+                        mods[mod_name] = q
+                    elif quant or (isinstance(mods[mod_name], Q4Linear) and attr == "bias"):
+                        biases[mod_name] = t.float()
+                    else:
+                        setattr(mod, attr, nn.Parameter(t.float(), requires_grad=False))
+        for mod_name, b in biases.items():
+            mods[mod_name].bias = nn.Parameter(b, requires_grad=False)
+        if model.tc.tie:
+            model.lm_head.weight = model.embed_tokens.weight
+        meta = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.is_meta]
+        assert not meta, f"eksik ağırlıklar: {meta[:5]}"
+        for q in model.parameters():
+            q.requires_grad_(True)
         return model
+
+    def n_params(self) -> int:
+        return sum(q.numel() for q in self.parameters()) + sum(
+            m.packed.numel() * (2 if m.bits == 4 else 1) for m in self.modules() if isinstance(m, Q4Linear))
 
     def convert(self, window: int = 64, sinks: int = 4, archival_frac: float = 0.25, keep_global=()) -> None:
         for i, layer in enumerate(self.layers):
@@ -341,8 +419,8 @@ class ConvLM(nn.Module):
                     "meta": meta or {}}, path)
 
     @classmethod
-    def load_converted(cls, model_dir, conv_path) -> "ConvLM":
-        model = cls.from_pretrained(model_dir)
+    def load_converted(cls, model_dir, conv_path, q4: bool = False) -> "ConvLM":
+        model = cls.from_pretrained(model_dir, q4=q4)
         ck = torch.load(conv_path, map_location="cpu", weights_only=False)
         for c in ck["conv"]:
             model.layers[c["i"]].self_attn.convert(c["window"], c["sinks"], c["archival"])
@@ -457,6 +535,9 @@ def main() -> None:
     p.add_argument("--sep", type=int, default=0, help="makale ayırıcı token")
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--dogrula", action="store_true", help="yalnız transformers ile birebirlik kontrolü yap")
+    p.add_argument("--q4", action="store_true", help="donuk öğretmen matrisleri 4-bit (büyük modeller 16 GB'a sığsın)")
+    p.add_argument("--hassas-bit", type=int, default=8, choices=[4, 8],
+                   help="--q4 ile v_proj/down_proj bit sayısı (8: daha kaliteli, 4: en küçük)")
     args = p.parse_args()
     if args.dogrula:
         verify_against_hf(args.model)
@@ -474,7 +555,7 @@ def main() -> None:
     gpu = device.type == "cuda"
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if gpu else contextlib.nullcontext()
 
-    model = ConvLM.from_pretrained(args.model)
+    model = ConvLM.from_pretrained(args.model, q4=args.q4, sensitive_bits=args.hassas_bit)
     model.convert(args.window, args.sinks, args.archival_frac, set(args.keep_global))
     for q in model.parameters():
         q.requires_grad_(False)
@@ -491,7 +572,7 @@ def main() -> None:
     kv_teacher = lambda n: tc.n_layers * 2 * tc.n_kv * tc.head_dim * n * 2
     state = sum(tc.n_heads * tc.head_dim ** 2 * 4 + 2 * tc.n_kv * tc.head_dim * (args.window + args.sinks) * 2
                 for i in range(tc.n_layers) if i not in args.keep_global)
-    print(f"Öğretmen {sum(q.numel() for q in model.parameters()) / 1e6:.0f}M param, {tc.n_layers} katman | yeni param "
+    print(f"Öğretmen {model.n_params() / 1e6:.0f}M param{' (4-bit)' if args.q4 else ''}, {tc.n_layers} katman | yeni param "
           f"{n_new / 1e6:.2f}M | pencere {args.window} + {args.sinks} çapa | bellek: öğretmen 8K'da "
           f"{kv_teacher(8192) / 2**20:.0f} MB, 1M'de {kv_teacher(2**20) / 2**30:.1f} GB → dönüşüm {state / 2**20:.1f} MB (sabit)",
           flush=True)
