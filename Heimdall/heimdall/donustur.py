@@ -419,6 +419,21 @@ def prepare_wikitext(model_dir: str, out_dir: str, train_tokens: int = 20_000_00
     return str(out / "wiki_train.bin"), str(out / "wiki_test.bin")
 
 
+@torch.no_grad()
+def verify_against_hf(model_name: str, n_tokens: int = 128) -> float:
+    """Öğretmen uygulamamızı transformers'ın resmi modeliyle karşılaştırır (dönüştürmeden önce çalıştır)."""
+    from transformers import AutoModelForCausalLM
+
+    path = fetch_model(model_name)
+    ids = torch.randint(0, 1000, (1, n_tokens))
+    ref = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).eval()(ids).logits
+    ours = ConvLM.from_pretrained(path).eval()(ids)
+    err = (ref - ours).abs().max().item()
+    print(f"{model_name}: en büyük logit farkı {err:.2e} (logit ölçeği {ref.abs().max().item():.1f}) → "
+          f"{'BİREBİR AYNI' if err < 1e-3 * ref.abs().max().item() else 'FARKLI: bu model desteklenmiyor'}")
+    return err
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="HF model klasörü ya da HF adı (ör. HuggingFaceTB/SmolLM2-135M)")
@@ -441,7 +456,11 @@ def main() -> None:
     p.add_argument("--eval-n", type=int, default=12)
     p.add_argument("--sep", type=int, default=0, help="makale ayırıcı token")
     p.add_argument("--threads", type=int, default=0)
+    p.add_argument("--dogrula", action="store_true", help="yalnız transformers ile birebirlik kontrolü yap")
     args = p.parse_args()
+    if args.dogrula:
+        verify_against_hf(args.model)
+        return
     if args.threads:
         torch.set_num_threads(args.threads)
     torch.manual_seed(0)
