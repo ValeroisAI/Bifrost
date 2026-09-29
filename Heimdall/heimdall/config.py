@@ -37,6 +37,11 @@ class HeimdallConfig:
     tie_embeddings: bool = True
     norm_eps: float = 1e-6
     kernel: str = "auto"           # auto: flash-linear-attention (Triton) varsa onu kullan | torch
+    # MoE (uzman karışımı): 0 = yoğun SwiGLU. Toplam parametre büyür, token başına hesap küçük kalır.
+    moe_experts: int = 0
+    moe_topk: int = 4
+    moe_hidden: int = 0            # uzman genişliği (0 → ffn_hidden / moe_topk)
+    moe_shared: bool = True        # her tokenin geçtiği paylaşılan uzman
 
     def __post_init__(self) -> None:
         assert self.layout and set(self.layout) <= {"D", "A"}, "layout yalnız D ve A içerebilir"
@@ -100,6 +105,10 @@ PRESETS = {
     "temel": TrainPreset(HeimdallConfig(d_model=768, n_layers=12, n_heads=6, archival_heads=2,
                                         attn_heads=12, attn_kv_heads=4), 2048, 8, 262_144, lr_adam=2e-3),
     # ~330M: gradient checkpointing ile 16 GB
+    # ~540M toplam / ~150M aktif MoE: token başına "temel" kadar hesap, 5 kat kapasite
+    "moe": TrainPreset(HeimdallConfig(d_model=768, n_layers=16, n_heads=6, archival_heads=2, attn_heads=12,
+                                      attn_kv_heads=4, moe_experts=32, moe_topk=4, moe_hidden=384), 2048, 8, 262_144,
+                       lr_adam=2e-3),
     "buyuk": TrainPreset(HeimdallConfig(d_model=1024, n_layers=24, n_heads=8, archival_heads=2,
                                         attn_heads=16, attn_kv_heads=4), 2048, 8, 262_144,
                          lr_muon=0.015, lr_adam=1.5e-3, grad_ckpt=True),

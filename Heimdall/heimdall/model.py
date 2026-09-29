@@ -176,6 +176,57 @@ class SwiGLU(nn.Module):
         return self.w3(F.silu(a) * b)
 
 
+class MoE(nn.Module):
+    """İnce taneli uzman karışımı (DeepSeek-V3 tarzı): sigmoid yönlendirici, top-k, paylaşılan uzman,
+    yardımcı kayıpsız yük dengeleme (yönlendirme sapması, yalnız seçimi etkiler)."""
+
+    def __init__(self, cfg: HeimdallConfig) -> None:
+        super().__init__()
+        d, e = cfg.d_model, cfg.moe_experts
+        h = cfg.moe_hidden or max(64, cfg.ffn_hidden // cfg.moe_topk)
+        self.e, self.k, self.h = e, cfg.moe_topk, h
+        self.router = nn.Linear(d, e, bias=False)
+        self.w12 = nn.Parameter(torch.randn(e, 2 * h, d) * 0.02)
+        self.w3 = nn.Parameter(torch.zeros(e, d, h))
+        self.shared = SwiGLU(d, h) if cfg.moe_shared else None
+        self.register_buffer("route_bias", torch.zeros(e))
+        self.balance_rate = 1e-3
+
+    def forward(self, x):
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        scores = torch.sigmoid(self.router(flat).float())
+        idx = (scores + self.route_bias).topk(self.k, dim=-1).indices                # [N,k]
+        w = scores.gather(-1, idx)
+        w = (w / w.sum(-1, keepdim=True)).to(x.dtype)
+        out = self._experts(flat, idx, w)
+        if self.shared is not None:
+            out = out + self.shared(flat)
+        if self.training:  # az kullanılan uzmanın sapmasını artır, çok kullanılanınkini azalt
+            with torch.no_grad():
+                load = torch.bincount(idx.flatten(), minlength=self.e).float()
+                self.route_bias += self.balance_rate * torch.sign(load.mean() - load)
+        return out.reshape(shape)
+
+    @torch.compiler.disable  # veri bağımlı döngü: derleyici dışında
+    def _experts(self, flat, idx, w):
+        n = flat.size(0)
+        order = idx.flatten().argsort()
+        tok = order // self.k
+        counts = torch.bincount(idx.flatten(), minlength=self.e).tolist()
+        wt = w.flatten()[order]
+        out = torch.zeros_like(flat)
+        start = 0
+        for e, c in enumerate(counts):
+            if c:
+                t = tok[start:start + c]
+                a, b = F.linear(flat[t], self.w12[e].to(flat.dtype)).chunk(2, dim=-1)
+                y = F.linear(F.silu(a) * b, self.w3[e].to(flat.dtype)) * wt[start:start + c, None]
+                out.index_add_(0, t, y.to(out.dtype))
+                start += c
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, cfg: HeimdallConfig, kind: str) -> None:
         super().__init__()
@@ -183,7 +234,7 @@ class Block(nn.Module):
         self.norm1 = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mixer = GatedDeltaNet(cfg) if kind == "D" else Attention(cfg)
         self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+        self.ffn = MoE(cfg) if cfg.moe_experts else SwiGLU(cfg.d_model, cfg.ffn_hidden)
 
     def forward(self, x, cache=None, pos=None, lens=None):
         x = x + self.mixer(self.norm1(x), cache, pos, lens)
@@ -214,6 +265,14 @@ class HeimdallLM(nn.Module):
         for name, m in self.named_modules():  # artık dal çıkışları sıfırdan başlar
             if isinstance(m, nn.Linear) and name.endswith(("o_proj", "w3")):
                 nn.init.zeros_(m.weight)
+
+    def active_params(self) -> int:
+        """Token başına kullanılan parametre (MoE'de yalnız seçilen uzmanlar)."""
+        n = self.num_params(non_embedding=True)
+        for b in self.blocks:
+            if isinstance(b.ffn, MoE):
+                n -= (b.ffn.e - b.ffn.k) * 3 * b.ffn.h * self.cfg.d_model
+        return n
 
     def num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())

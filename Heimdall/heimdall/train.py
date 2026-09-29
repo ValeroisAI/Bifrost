@@ -142,7 +142,7 @@ def main(argv=None) -> None:
     mix = Mixture(args.data, args.val_frac, seed=args.seed + step)
     val = mix.val_batches(seq_len, args.eval_batches)
     total = max(1, int(args.tokens // (accum * micro * seq_len)))
-    n_matmul = model.num_params(non_embedding=True) + model.lm_head.weight.numel()
+    n_matmul = model.active_params() + model.lm_head.weight.numel()
     train_model = torch.compile(model) if args.compile and device.type != "cpu" else model
 
     out = Path(args.out)
@@ -151,7 +151,7 @@ def main(argv=None) -> None:
     logf = open(out / "log.jsonl", "a")
     gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
     hip = f" ROCm {torch.version.hip}" if torch.version.hip else ""
-    print(f"Heimdall [{args.arch}, düzen {cfg.layout}] {model.num_params() / 1e6:.1f}M param | d={cfg.d_model} "
+    print(f"Heimdall [{args.arch}, düzen {cfg.layout}] {model.num_params() / 1e6:.1f}M param ({model.active_params() / 1e6:.0f}M aktif) | d={cfg.d_model} "
           f"L={cfg.n_layers} | {gpu}{hip} | {'bf16' if bf16 else 'fp32'} | delta çekirdeği: {backend}")
     print(f"T={seq_len} mikro={micro} birikim={accum} → adım başına {accum * micro * seq_len:,} token, {total:,} adım "
           f"| Muon {lr_muon} AdamW {lr_adam} | veri: {mix.describe()}", flush=True)

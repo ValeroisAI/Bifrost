@@ -110,6 +110,9 @@ python -m heimdall.train --resume runs/temel/last.pt
 | `kucuk` | 44.8M | 45.9M | 512 × 12 | 1024 | 128K | – |
 | `temel` | 96.1M | 98.3M | 768 × 12 | 2048 | 256K | – |
 | `buyuk` | 333M | 342M | 1024 × 24 | 2048 | 256K | ✓ |
+| `moe` | 518M toplam / 115M aktif | – | 768 × 16, 32 uzman top-4 | 2048 | 256K | – |
+
+**MoE (`--preset moe`):** ince taneli uzmanlar (32 uzman, token başına 4 + paylaşılan uzman), sigmoid yönlendirici, yardımcı kayıpsız yük dengeleme (DeepSeek-V3 tarzı). Token başına hesap `temel` ile aynı, kapasite ~5 kat. Aynı FLOP bütçesinde yoğun modelden belirgin düşük loss beklenir; DeepSeek ve OLMoE sonuçları bu yönde. Uzman ağırlıkları da Muon ile güncellenir.
 
 Eğitim yığını:
 - bf16 ve `torch.compile`.

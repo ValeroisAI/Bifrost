@@ -40,7 +40,7 @@ class Muon(torch.optim.Optimizer):
                 buf.lerp_(p.grad, 1 - mom)
                 u = p.grad.lerp(buf, mom)  # Nesterov
                 parts = u.split(list(getattr(p, "muon_split", (p.size(0),))), dim=0)
-                u = torch.cat([zeropower_ns5(s) * max(1.0, s.size(0) / s.size(1)) ** 0.5 for s in parts], dim=0)
+                u = torch.cat([zeropower_ns5(s) * max(1.0, s.size(-2) / s.size(-1)) ** 0.5 for s in parts], dim=0)
                 if group["weight_decay"]:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(u, alpha=-group["lr"])
@@ -55,7 +55,7 @@ def build_optimizers(model: nn.Module, lr_muon: float, lr_adam: float, use_muon:
         seen.add(id(p))
         if id(p) in embed_ids:
             embed.append(p)
-        elif p.ndim == 2 and min(p.shape) >= 64:
+        elif p.ndim in (2, 3) and min(p.shape[-2:]) >= 64:
             muon.append(p)
         else:
             rest.append(p)
