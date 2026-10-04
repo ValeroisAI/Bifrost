@@ -59,6 +59,17 @@ Kısaca: saf doğrusal modeller kopyalama ve tam hatırlamada Transformer'a yeni
 
 Bellek sınırı KV cache olduğunda, aynı 16 GB'lık kartta ~12 kat daha fazla eşzamanlı kullanıcı ya da ~12 kat daha uzun bağlam demektir. Prefill parçalı yapılır (`--prefill-chunk`), bu yüzden uzun istemde karesel bellek patlaması olmaz.
 
+### Ölçüm: bağlam içi hatırlama (MQAR, `bench/mqar.py`)
+Dizinin başında 8 anahtar→değer çifti veriliyor, bazıları güncelleniyor; araya boşluk konuyor, sonra anahtarlar soruluyor. Eğitimde boşluk en fazla 64 token. ~100K parametre, 2 katman, CPU'da 8 dakika:
+
+| Model | boşluk 64 | 1.024 | 16.384 |
+|---|---|---|---|
+| Saf dikkat (Transformer) | %15.6 | %3.5 | %0.8 |
+| Saf Gated DeltaNet | %14.5 | %14.8 | %14.8 |
+| **Hibrit (1 DeltaNet + 1 dikkat)** | **%99.9** | **%100** | **%100** |
+
+Aynı bütçede ne saf dikkat ne saf delta görevi öğrendi; hibrit öğrendi ve eğitimde gördüğünün 256 katı uzaklığa genelledi. Tek tohum, küçük ölçek. Büyük modelde tekrar ölçülmeli.
+
 ### Mimari türleri
 | `--arch` | Düzen | Kullanım |
 |---|---|---|
