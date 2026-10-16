@@ -280,4 +280,4 @@ python -m heimdall.donustur --model Qwen/Qwen3-8B --q4 --wikitext veri/wikitext 
 
 Yalnız pencere ile öğretmen arasındaki farkın ~%70'i yalnızca 0.8M tokenle kapandı; öğretmenin hâlâ %25 gerisinde (ppl 17.61 / 14.09). Aşama B kaybı eğitim bitiminde hâlâ düşüyordu. Tek model, tek tohum, 16 pencerelik ölçüm. Daha uzun eğitimin farkı ne kadar kapatacağı ölçülmedi.
 
-Uzun bağlam kalitesi henüz öğretmene ulaşmadı; uçtan uca damıtma GPU'da koşulacak. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
+Uzun bağlam kalitesi henüz öğretmene ulaşmadı. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
