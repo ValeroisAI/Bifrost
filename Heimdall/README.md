@@ -268,4 +268,16 @@ Doğrulananlar (CPU, `tests/test_bifrost.py`):
 python -m heimdall.donustur --model Qwen/Qwen3-8B --q4 --wikitext veri/wikitext --out kosular/qwen3_8b --window 1024 --seq-len 2048 --batch 1
 ```
 
+**GPU sonucu (RX 9070 XT, SmolLM2-135M, pencere 64, wikitext, 2K bağlam).** Aşama A 0.41M token (~80 sn), aşama B 0.41M token (~2.5 dk):
+
+| | ppl | 64-256. token | 1024-2048. token |
+|---|---|---|---|
+| Öğretmen (tam dikkat) | 14.09 | 15.65 | 12.59 |
+| Yalnız pencere (64 + 4 çapa) | 25.76 | 21.15 | 26.69 |
+| Dönüşüm, eğitimsiz | 26.70 | 21.55 | 27.71 |
+| Aşama A sonrası (katman taklidi) | 22.43 | 20.31 | 22.69 |
+| **Aşama B sonrası (uçtan uca damıtma)** | **17.61** | **16.98** | **17.27** |
+
+Yalnız pencere ile öğretmen arasındaki farkın ~%70'i yalnızca 0.8M tokenle kapandı; öğretmenin hâlâ %25 gerisinde (ppl 17.61 / 14.09). Aşama B kaybı eğitim bitiminde hâlâ düşüyordu. Tek model, tek tohum, 16 pencerelik ölçüm. Daha uzun eğitimin farkı ne kadar kapatacağı ölçülmedi.
+
 Uzun bağlam kalitesi henüz öğretmene ulaşmadı; uçtan uca damıtma GPU'da koşulacak. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
