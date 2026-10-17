@@ -42,12 +42,17 @@ class HeimdallConfig:
     moe_topk: int = 4
     moe_hidden: int = 0            # uzman genişliği (0 → ffn_hidden / moe_topk)
     moe_shared: bool = True        # her tokenin geçtiği paylaşılan uzman
+    # Gizli ağırlıksız düşük bit (bit.py): 0 = yoğun | 1 = ikili (±1) | 2 = üçlü (−1/0/+1). Embedding, LM başı,
+    # kapılar ve normlar yoğun kalır.
+    bits: int = 0
 
     def __post_init__(self) -> None:
         assert self.layout and set(self.layout) <= {"D", "A"}, "layout yalnız D ve A içerebilir"
         assert self.attn_heads % self.attn_kv_heads == 0, "attn_heads, attn_kv_heads'e bölünmeli"
         assert 0 <= self.archival_heads <= self.n_heads
         assert self.conv_kernel >= 2 and self.head_dim % 2 == 0 and self.attn_head_dim % 2 == 0
+        assert self.bits in (0, 1, 2), "bits: 0, 1 ya da 2"
+        assert not (self.bits and self.moe_experts), "bits ile MoE henüz birlikte desteklenmiyor"
         assert self.attn_rope in ("auto", "rope", "none") and self.kernel in ("auto", "torch")
 
     @property

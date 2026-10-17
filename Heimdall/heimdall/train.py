@@ -25,6 +25,7 @@ import torch
 
 from . import kernels
 from .config import ARCHS, PRESETS, HeimdallConfig, apply_arch
+from .bit import BitFlip, bit_stats
 from .data import Loader, Mixture
 from .model import HeimdallLM
 from .optim import build_optimizers, set_lr, wsd
@@ -44,6 +45,8 @@ def parse_args(argv=None):
     p.add_argument("--n-layers", type=int)
     p.add_argument("--layout", help="katman düzeni, ör. DDDA, DDA, A")
     p.add_argument("--attn-window", type=int)
+    p.add_argument("--bits", type=int, choices=[0, 1, 2], help="gizli ağırlıksız: 1 = ikili (±1), 2 = üçlü (−1/0/+1)")
+    p.add_argument("--flip-orani", type=float, default=2e-3, help="--bits: adım başına çevrilen ağırlık oranı (tepe)")
     p.add_argument("--lr-muon", type=float)
     p.add_argument("--lr-adam", type=float)
     p.add_argument("--adamw-only", action="store_true")
@@ -69,7 +72,7 @@ def parse_args(argv=None):
 def build_config(args) -> HeimdallConfig:
     cfg = apply_arch(PRESETS[args.preset].model, args.arch)
     over = {k: v for k, v in dict(d_model=args.d_model, n_layers=args.n_layers, layout=args.layout,
-                                  attn_window=args.attn_window, kernel=args.kernel).items() if v is not None}
+                                  attn_window=args.attn_window, kernel=args.kernel, bits=args.bits).items() if v is not None}
     return replace(cfg, **over)
 
 
@@ -131,7 +134,9 @@ def main(argv=None) -> None:
 
     model = HeimdallLM(cfg).to(device)
     model.grad_ckpt = grad_ckpt
-    optimizers = build_optimizers(model, lr_muon, lr_adam, use_muon=not args.adamw_only)
+    optimizers = build_optimizers(model, lr_muon, lr_adam, use_muon=not args.adamw_only, flip_rate=args.flip_orani)
+    flipper = next((o for o in optimizers if isinstance(o, BitFlip)), None)
+    clip_params = [p for p in model.parameters() if not getattr(p, "bit", 0)]   # bit ağırlıkları kendi optimizer'ında
     step, tokens = 0, 0
     if ckpt:
         model.load_state_dict(ckpt["model"])
@@ -176,7 +181,7 @@ def main(argv=None) -> None:
                     loss = train_model(x, y)
                 (loss / accum).backward()
                 loss_acc += loss.detach().float() / accum
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             for opt in optimizers:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
@@ -191,8 +196,13 @@ def main(argv=None) -> None:
                 rec = {"step": step, "tokens": tokens, "loss": float(loss_acc), "grad_norm": float(gnorm), "tok_s": tps,
                        "tflops": tps * flops_per_token(cfg, n_matmul, seq_len) / 1e12,
                        "mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0}
+                extra = ""
+                if flipper is not None:
+                    rec["flip"] = flipper.last_flip_frac
+                    rec["sifir_orani"] = bit_stats(model)["sifir_orani"]
+                    extra = f" | flip {100 * rec['flip']:.3f}% sıfır {100 * rec['sifir_orani']:.0f}%"
                 print(f"adım {step:6d}/{total} | loss {rec['loss']:.4f} | {tps:,.0f} tok/s | ~{rec['tflops']:.1f} TFLOPS"
-                      f" | grad {rec['grad_norm']:.2f} | {rec['mem_gb']:.1f} GB | {tokens / 1e6:,.0f}M tok", flush=True)
+                      f" | grad {rec['grad_norm']:.2f} | {rec['mem_gb']:.1f} GB | {tokens / 1e6:,.0f}M tok" + extra, flush=True)
                 logf.write(json.dumps(rec) + "\n")
                 logf.flush()
                 t0, tok0 = time.time(), 0

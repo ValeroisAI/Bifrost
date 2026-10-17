@@ -46,14 +46,20 @@ class Muon(torch.optim.Optimizer):
                 p.add_(u, alpha=-group["lr"])
 
 
-def build_optimizers(model: nn.Module, lr_muon: float, lr_adam: float, use_muon: bool = True) -> list:
+def build_optimizers(model: nn.Module, lr_muon: float, lr_adam: float, use_muon: bool = True,
+                     flip_rate: float = 2e-3) -> list:
+    """Sıra sabit (checkpoint buna göre yüklenir): [Muon], AdamW, [BitFlip]."""
+    from .bit import BitFlip
+
     embed_ids = {id(model.embed.weight), id(model.lm_head.weight)}
-    muon, embed, rest, seen = [], [], [], set()
+    muon, embed, rest, bit, seen = [], [], [], [], set()
     for p in model.parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        if id(p) in embed_ids:
+        if getattr(p, "bit", 0):
+            bit.append(p)
+        elif id(p) in embed_ids:
             embed.append(p)
         elif p.ndim in (2, 3) and min(p.shape[-2:]) >= 64:
             muon.append(p)
@@ -67,7 +73,10 @@ def build_optimizers(model: nn.Module, lr_muon: float, lr_adam: float, use_muon:
         adam = torch.optim.AdamW(groups, fused=torch.cuda.is_available(), **kw)
     except (RuntimeError, TypeError):
         adam = torch.optim.AdamW(groups, **kw)
-    return [Muon(muon, lr=lr_muon), adam] if use_muon else [adam]
+    opts = [Muon(muon, lr=lr_muon), adam] if (use_muon and muon) else [adam]
+    if bit:
+        opts.append(BitFlip(bit, lr=flip_rate))
+    return opts
 
 
 def wsd(progress: float, warmup: float = 0.01, decay_start: float = 0.75) -> float:
