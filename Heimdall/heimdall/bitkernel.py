@@ -173,8 +173,12 @@ def bit_int8_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 class PackedBitLinear(nn.Module):
     """Yalnız çıkarım. Ağırlık 1/2 bit paketli; bellek bf16'nın 1/16 (ikili) ya da 1/8 (üçlü) kadar."""
 
-    def __init__(self, weight: torch.Tensor, scale: torch.Tensor, bits: int) -> None:
+    def __init__(self, weight: torch.Tensor, scale: torch.Tensor, bits: int, lr_u=None, lr_v=None) -> None:
         super().__init__()
+        self.has_lr = lr_u is not None
+        if self.has_lr:  # yoğun düşük-rank düzeltici paketlenmez (küçük)
+            self.register_buffer("lr_u", lr_u.detach().clone())
+            self.register_buffer("lr_v", lr_v.detach().clone())
         self.bits, self.in_features, self.out_features = bits, weight.size(1), weight.size(0)
         self.register_buffer("packed", pack_weights(weight, bits))
         self.register_buffer("scale", scale.float().contiguous())
@@ -185,11 +189,16 @@ class PackedBitLinear(nn.Module):
         if HAS_TRITON and x.is_cuda:
             try:
                 y = packed_matmul(x2d, self.packed, self.scale, self.bits, self.in_features)
+                if self.has_lr:
+                    y = y + F.linear(F.linear(x2d, self.lr_v.to(x.dtype)), self.lr_u.to(x.dtype))
                 return y.reshape(*shape[:-1], -1)
             except Exception as e:
                 _warn_once("packed", f"paketli çekirdek çalışmadı ({type(e).__name__}: {str(e)[:120]}); torch yolu")
         w = unpack_weights(self.packed, self.bits, self.in_features, x.dtype)
-        return (F.linear(x2d, w) * self.scale.to(x.dtype)).reshape(*shape[:-1], -1)
+        y = F.linear(x2d, w) * self.scale.to(x.dtype)
+        if self.has_lr:
+            y = y + F.linear(F.linear(x2d, self.lr_v.to(x.dtype)), self.lr_u.to(x.dtype))
+        return y.reshape(*shape[:-1], -1)
 
 
 def pack_bit_model(model: nn.Module) -> int:
@@ -201,7 +210,8 @@ def pack_bit_model(model: nn.Module) -> int:
         for name, child in list(parent.named_children()):
             if isinstance(child, BitLinear):
                 scale = (child.base * child.scale).detach()
-                packed = PackedBitLinear(child.weight.detach(), scale, child.bits)
+                lr = (child.lr_u, child.lr_v) if child.rank else (None, None)
+                packed = PackedBitLinear(child.weight.detach(), scale, child.bits, *lr)
                 saved += child.weight.numel() * child.weight.element_size() - packed.packed.numel()
                 setattr(parent, name, packed)
     return saved

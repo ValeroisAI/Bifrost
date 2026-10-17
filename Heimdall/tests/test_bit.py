@@ -56,6 +56,28 @@ def test_cache_equals_full():
         assert (torch.cat(parts, 1) - full).abs().max().item() < 1e-4, bits
 
 
+def test_scope_and_rank():
+    for scope, rank in (("ffn", 0), ("mix", 0), ("all", 4)):
+        torch.manual_seed(3)
+        cfg = replace(BASE, bits=2, bit_scope=scope, bit_rank=rank)
+        m = HeimdallLM(cfg)
+        kinds = {n.split(".")[-1]: isinstance(x, BitLinear) for n, x in m.named_modules()
+                 if n.split(".")[-1] in ("w12", "w3", "o_proj")}
+        assert kinds["w12"] == (scope in ("all", "ffn")) and kinds["o_proj"] == (scope in ("all", "mix")), (scope, kinds)
+        opts = build_optimizers(m, 0.02, 3e-3, flip_rate=0.01)
+        ids = torch.randint(0, 300, (4, 33))
+        first = None
+        for _ in range(60):
+            loss = m(ids[:, :-1], ids[:, 1:])
+            loss.backward()
+            first = first if first is not None else loss.item()
+            for o in opts:
+                o.step(); o.zero_grad(set_to_none=True)
+        assert loss.item() < 0.7 * first, (scope, rank, first, loss.item())
+        if rank:
+            assert any(p.abs().sum() > 0 for n, p in m.named_parameters() if n.endswith("lr_u"))
+
+
 def test_memory_per_param():
     m = HeimdallLM(replace(BASE, bits=1))
     n = sum(x.weight.numel() for x in m.modules() if isinstance(x, BitLinear))
@@ -63,6 +85,6 @@ def test_memory_per_param():
 
 
 if __name__ == "__main__":
-    for fn in (test_values_and_learning, test_cache_equals_full, test_memory_per_param):
+    for fn in (test_values_and_learning, test_cache_equals_full, test_scope_and_rank, test_memory_per_param):
         fn()
         print("OK ", fn.__name__)

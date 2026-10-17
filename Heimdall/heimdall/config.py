@@ -45,6 +45,8 @@ class HeimdallConfig:
     # Gizli ağırlıksız düşük bit (bit.py): 0 = yoğun | 1 = ikili (±1) | 2 = üçlü (−1/0/+1). Embedding, LM başı,
     # kapılar ve normlar yoğun kalır.
     bits: int = 0
+    bit_scope: str = "all"         # hangi matrisler bit: "all" | "ffn" (yalnız SwiGLU) | "mix" (yalnız karıştırıcı)
+    bit_rank: int = 0              # >0: her BitLinear'a yoğun düşük-rank düzeltici (U·V, bit ağırlıkların yanında)
 
     def __post_init__(self) -> None:
         assert self.layout and set(self.layout) <= {"D", "A"}, "layout yalnız D ve A içerebilir"
@@ -52,6 +54,7 @@ class HeimdallConfig:
         assert 0 <= self.archival_heads <= self.n_heads
         assert self.conv_kernel >= 2 and self.head_dim % 2 == 0 and self.attn_head_dim % 2 == 0
         assert self.bits in (0, 1, 2), "bits: 0, 1 ya da 2"
+        assert self.bit_scope in ("all", "ffn", "mix") and self.bit_rank >= 0
         assert not (self.bits and self.moe_experts), "bits ile MoE henüz birlikte desteklenmiyor"
         assert self.attn_rope in ("auto", "rope", "none") and self.kernel in ("auto", "torch")
 

@@ -48,13 +48,15 @@ def test_module_paths_match_dense():
 
     cfg = HeimdallConfig(vocab_size=300, d_model=64, n_layers=2, n_heads=2, head_dim=32, archival_heads=1, attn_heads=4,
                          attn_kv_heads=2, attn_head_dim=16, chunk_size=16, kernel="torch")
-    for bits in (1, 2):
+    for bits, rank in ((1, 0), (2, 0), (2, 4)):
         torch.manual_seed(2)
-        m = HeimdallLM(replace(cfg, bits=bits)).eval()
+        m = HeimdallLM(replace(cfg, bits=bits, bit_rank=rank)).eval()
         with torch.no_grad():
             for n, p in m.named_parameters():
                 if n.endswith(("o_proj.scale", "w3.scale")):
                     p.fill_(1.0)
+                if n.endswith("lr_u"):
+                    p.normal_(0, 0.1)
             ids = torch.randint(0, 300, (2, 24))
             dense = m(ids)
             saved = pack_bit_model(m)                  # CPU'da torch açma yolu (çekirdek yok); format doğrulanır

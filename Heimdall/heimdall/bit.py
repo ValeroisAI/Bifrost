@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 
 class BitLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bits: int = 1) -> None:
+    def __init__(self, in_features: int, out_features: int, bits: int = 1, rank: int = 0) -> None:
         super().__init__()
         assert bits in (1, 2), "bits: 1 = ikili (±1), 2 = üçlü (−1/0/+1)"
         self.in_features, self.out_features, self.bits = in_features, out_features, bits
@@ -31,6 +31,10 @@ class BitLinear(nn.Module):
         self.weight.bit = bits                               # optimizer ayrımı için işaret
         self.register_buffer("base", torch.full((out_features,), 0.02))
         self.scale = nn.Parameter(torch.ones(out_features))
+        self.rank = rank
+        if rank:  # yoğun düşük-rank düzeltici: bit ağırlıkların tutamadığı yönler. U sıfırdan başlar (LoRA gibi)
+            self.lr_u = nn.Parameter(torch.zeros(out_features, rank))
+            self.lr_v = nn.Parameter(torch.randn(rank, in_features) * in_features ** -0.5)
         self.kernel = "off"                                  # "int8": Triton int8 GEMM (bitkernel.py)
         self.reset_parameters()
 
@@ -60,7 +64,10 @@ class BitLinear(nn.Module):
             y = bit_int8_linear(x, self.weight)
         else:
             y = F.linear(x, self.weight.to(x.dtype))
-        return y * (self.base * self.scale).to(y.dtype)
+        y = y * (self.base * self.scale).to(y.dtype)
+        if self.rank:
+            y = y + F.linear(F.linear(x, self.lr_v.to(x.dtype)), self.lr_u.to(x.dtype))
+        return y
 
     def extra_repr(self) -> str:
         return f"{self.in_features}→{self.out_features}, {'ikili' if self.bits == 1 else 'üçlü'}"

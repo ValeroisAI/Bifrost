@@ -30,9 +30,15 @@ from .config import HeimdallConfig
 from .kernels import RMSNorm, causal_attention, causal_conv, delta_rule, delta_rule_step, rope
 
 
-def make_linear(bits: int, d_in: int, d_out: int) -> nn.Module:
+def make_linear(bits: int, d_in: int, d_out: int, rank: int = 0) -> nn.Module:
     """Gizli matrisler: yoğun nn.Linear ya da gizli ağırlıksız BitLinear (bit.py)."""
-    return BitLinear(d_in, d_out, bits) if bits else nn.Linear(d_in, d_out, bias=False)
+    return BitLinear(d_in, d_out, bits, rank) if bits else nn.Linear(d_in, d_out, bias=False)
+
+
+def _lin(cfg: HeimdallConfig, role: str, d_in: int, d_out: int) -> nn.Module:
+    """role: "mix" (DeltaNet/dikkat projeksiyonları) | "ffn". cfg.bit_scope hangi rollerin bit olacağını seçer."""
+    bits = cfg.bits if (cfg.bits and cfg.bit_scope in ("all", role)) else 0
+    return make_linear(bits, d_in, d_out, cfg.bit_rank)
 
 
 class GatedDeltaNet(nn.Module):
@@ -40,13 +46,13 @@ class GatedDeltaNet(nn.Module):
         super().__init__()
         d, h, dh = cfg.d_model, cfg.n_heads, cfg.head_dim
         self.cfg, self.h, self.dh, self.inner = cfg, h, dh, h * dh
-        self.qkv = make_linear(cfg.bits, d, 3 * self.inner)
+        self.qkv = _lin(cfg, "mix", d, 3 * self.inner)
         self.qkv.weight.muon_split = (self.inner,) * 3
         self.conv = nn.Parameter(torch.zeros(3 * self.inner, cfg.conv_kernel))
         self.ab = nn.Linear(d, 2 * h, bias=True)
-        self.g_proj = make_linear(cfg.bits, d, self.inner)
+        self.g_proj = _lin(cfg, "mix", d, self.inner)
         self.o_norm = RMSNorm(dh, cfg.norm_eps)
-        self.o_proj = make_linear(cfg.bits, self.inner, d)
+        self.o_proj = _lin(cfg, "mix", self.inner, d)
         self.A_log = nn.Parameter(torch.empty(h).uniform_(1.0, 16.0).log())
         dt = torch.exp(torch.empty(h).uniform_(math.log(1e-3), math.log(1e-1)))
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
@@ -92,12 +98,12 @@ class Attention(nn.Module):
         d, h, hkv, dh = cfg.d_model, cfg.attn_heads, cfg.attn_kv_heads, cfg.attn_head_dim
         self.h, self.hkv, self.dh, self.window = h, hkv, dh, cfg.attn_window
         self.rope_base = cfg.rope_base if cfg.use_rope else 0.0
-        self.qkv = make_linear(cfg.bits, d, (h + 2 * hkv) * dh)
+        self.qkv = _lin(cfg, "mix", d, (h + 2 * hkv) * dh)
         self.qkv.weight.muon_split = (h * dh, hkv * dh, hkv * dh)
         self.q_norm = RMSNorm(dh, cfg.norm_eps)
         self.k_norm = RMSNorm(dh, cfg.norm_eps)
-        self.gate = make_linear(cfg.bits, d, h * dh) if cfg.attn_gate else None
-        self.o_proj = make_linear(cfg.bits, h * dh, d)
+        self.gate = _lin(cfg, "mix", d, h * dh) if cfg.attn_gate else None
+        self.o_proj = _lin(cfg, "mix", h * dh, d)
 
     def empty_cache(self, batch: int, device, dtype) -> dict:
         cap = self.window  # pencere: halka tampon (sabit); global: gerektikçe büyür
@@ -171,11 +177,11 @@ class Attention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, d: int, hidden: int, bits: int = 0) -> None:
+    def __init__(self, d: int, hidden: int, bits: int = 0, rank: int = 0) -> None:
         super().__init__()
-        self.w12 = make_linear(bits, d, 2 * hidden)
+        self.w12 = make_linear(bits, d, 2 * hidden, rank)
         self.w12.weight.muon_split = (hidden, hidden)
-        self.w3 = make_linear(bits, hidden, d)
+        self.w3 = make_linear(bits, hidden, d, rank)
 
     def forward(self, x):
         a, b = self.w12(x).chunk(2, dim=-1)
@@ -240,7 +246,7 @@ class Block(nn.Module):
         self.norm1 = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mixer = GatedDeltaNet(cfg) if kind == "D" else Attention(cfg)
         self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.ffn = MoE(cfg) if cfg.moe_experts else SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.bits)
+        self.ffn = MoE(cfg) if cfg.moe_experts else SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.bits if cfg.bit_scope in ("all", "ffn") else 0, cfg.bit_rank)
 
     def forward(self, x, cache=None, pos=None, lens=None):
         x = x + self.mixer(self.norm1(x), cache, pos, lens)

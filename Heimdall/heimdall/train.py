@@ -46,6 +46,8 @@ def parse_args(argv=None):
     p.add_argument("--layout", help="katman düzeni, ör. DDDA, DDA, A")
     p.add_argument("--attn-window", type=int)
     p.add_argument("--bits", type=int, choices=[0, 1, 2], help="gizli ağırlıksız: 1 = ikili (±1), 2 = üçlü (−1/0/+1)")
+    p.add_argument("--bit-scope", choices=["all", "ffn", "mix"], help="--bits: hangi matrisler bit (ffn = yalnız SwiGLU)")
+    p.add_argument("--bit-rank", type=int, help="--bits: bit matrislere yoğun düşük-rank düzeltici (ör. 16)")
     p.add_argument("--bit-kernel", choices=["off", "int8"], default="off",
                    help="--bits: Triton int8 GEMM (eğitim/prefill). Önce bench/bitkernel.py ile hızı ölç")
     p.add_argument("--flip-orani", type=float, default=2e-3, help="--bits: adım başına çevrilen ağırlık oranı (tepe)")
@@ -74,7 +76,8 @@ def parse_args(argv=None):
 def build_config(args) -> HeimdallConfig:
     cfg = apply_arch(PRESETS[args.preset].model, args.arch)
     over = {k: v for k, v in dict(d_model=args.d_model, n_layers=args.n_layers, layout=args.layout,
-                                  attn_window=args.attn_window, kernel=args.kernel, bits=args.bits).items() if v is not None}
+                                  attn_window=args.attn_window, kernel=args.kernel, bits=args.bits,
+                                  bit_scope=args.bit_scope, bit_rank=args.bit_rank).items() if v is not None}
     return replace(cfg, **over)
 
 
