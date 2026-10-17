@@ -338,6 +338,7 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     p.add_argument("--device", default=None)
+    p.add_argument("--packed", action="store_true", help="bit modelinde ağırlıkları 1/2 bit paketle (bellek 8-16× az)")
     p.add_argument("--max-batch", type=int, default=32)
     p.add_argument("--max-context", type=int, default=16384)
     p.add_argument("--prefill-chunk", type=int, default=2048)
@@ -358,6 +359,9 @@ def main() -> None:
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
     model = load_model(args.model, device, dtype)
     log.info("delta çekirdeği: %s", kernels.prepare(device, model.cfg.kernel))
+    if args.packed:
+        from .bitkernel import pack_bit_model
+        log.info("paketleme: %.1f MB bellek kazanıldı", pack_bit_model(model) / 2**20)
     tok = Tokenizer.from_file(tokenizer_path(args.model, args.tokenizer))
     engine = Engine(model, args.max_batch, args.max_context, args.prefill_chunk).start()
     settings = Settings(model_name=args.name, api_key_hashes=load_keys(os.environ.get("HEIMDALL_API_KEYS"),

@@ -25,7 +25,7 @@ import torch
 
 from . import kernels
 from .config import ARCHS, PRESETS, HeimdallConfig, apply_arch
-from .bit import BitFlip, bit_stats
+from .bit import BitFlip, bit_stats, set_bit_kernel
 from .data import Loader, Mixture
 from .model import HeimdallLM
 from .optim import build_optimizers, set_lr, wsd
@@ -46,6 +46,8 @@ def parse_args(argv=None):
     p.add_argument("--layout", help="katman düzeni, ör. DDDA, DDA, A")
     p.add_argument("--attn-window", type=int)
     p.add_argument("--bits", type=int, choices=[0, 1, 2], help="gizli ağırlıksız: 1 = ikili (±1), 2 = üçlü (−1/0/+1)")
+    p.add_argument("--bit-kernel", choices=["off", "int8"], default="off",
+                   help="--bits: Triton int8 GEMM (eğitim/prefill). Önce bench/bitkernel.py ile hızı ölç")
     p.add_argument("--flip-orani", type=float, default=2e-3, help="--bits: adım başına çevrilen ağırlık oranı (tepe)")
     p.add_argument("--lr-muon", type=float)
     p.add_argument("--lr-adam", type=float)
@@ -134,6 +136,7 @@ def main(argv=None) -> None:
 
     model = HeimdallLM(cfg).to(device)
     model.grad_ckpt = grad_ckpt
+    set_bit_kernel(model, args.bit_kernel)
     optimizers = build_optimizers(model, lr_muon, lr_adam, use_muon=not args.adamw_only, flip_rate=args.flip_orani)
     flipper = next((o for o in optimizers if isinstance(o, BitFlip)), None)
     clip_params = [p for p in model.parameters() if not getattr(p, "bit", 0)]   # bit ağırlıkları kendi optimizer'ında

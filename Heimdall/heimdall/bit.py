@@ -31,6 +31,7 @@ class BitLinear(nn.Module):
         self.weight.bit = bits                               # optimizer ayrımı için işaret
         self.register_buffer("base", torch.full((out_features,), 0.02))
         self.scale = nn.Parameter(torch.ones(out_features))
+        self.kernel = "off"                                  # "int8": Triton int8 GEMM (bitkernel.py)
         self.reset_parameters()
 
     @torch.no_grad()
@@ -54,7 +55,11 @@ class BitLinear(nn.Module):
             self.scale.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight.to(x.dtype))
+        if self.kernel == "int8" and x.is_cuda:
+            from .bitkernel import bit_int8_linear
+            y = bit_int8_linear(x, self.weight)
+        else:
+            y = F.linear(x, self.weight.to(x.dtype))
         return y * (self.base * self.scale).to(y.dtype)
 
     def extra_repr(self) -> str:
@@ -100,6 +105,12 @@ class BitFlip(torch.optim.Optimizer):
                 total += p.numel()
                 st["m"].copy_(mf.to(st["m"].dtype))
         self.last_flip_frac = flipped / max(total, 1)
+
+
+def set_bit_kernel(model: nn.Module, kernel: str) -> None:
+    for m in model.modules():
+        if isinstance(m, BitLinear):
+            m.kernel = kernel
 
 
 def bit_stats(model: nn.Module) -> dict:
