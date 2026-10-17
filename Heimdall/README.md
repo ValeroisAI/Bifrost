@@ -281,3 +281,31 @@ python -m heimdall.donustur --model Qwen/Qwen3-8B --q4 --wikitext veri/wikitext 
 Yalnız pencere ile öğretmen arasındaki farkın ~%70'i yalnızca 0.8M tokenle kapandı; öğretmenin hâlâ %25 gerisinde (ppl 17.61 / 14.09). Aşama B kaybı eğitim bitiminde hâlâ düşüyordu. Tek model, tek tohum, 16 pencerelik ölçüm. Daha uzun eğitimin farkı ne kadar kapatacağı ölçülmedi.
 
 Uzun bağlam kalitesi henüz öğretmene ulaşmadı. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
+
+
+---
+
+## 8. Heimdall-Bit (`--arch bit`): gizli ağırlıksız düşük bit eğitim
+
+FFN matrisleri gizli ağırlıksız üçlü (−1/0/+1, `BitFlip` optimizer), karıştırıcı projeksiyonları yoğun (Muon), her bit matrisin yanında yoğun düşük-rank düzeltici (rank 16). Embedding, LM başı ve normlar yoğun. Bit ağırlıklar toplam parametrenin `temel`'de %58'i, `buyuk`'ta %62'si.
+
+Tasarım ölçümle seçildi (`bench/bit_matrix.sh`, RX 9070 XT, d=192 L=8 hibrit, 10M token, tek tohum):
+
+| Varyant | Param | Val loss | Yoğundan fark | tok/s |
+|---|---|---|---|---|
+| Yoğun | 5.8M | 1.785 | — | 78.8K |
+| Tümü üçlü | 5.8M | 2.093 | +0.308 | 72.9K |
+| Tümü ikili (±1) | 5.8M | 2.128 | +0.343 | 73.8K |
+| Tümü üçlü, %25 geniş | 8.0M | 1.994 | +0.209 | 69.5K |
+| Tümü üçlü + rank 16 | 6.3M | 1.997 | +0.212 | 66.8K |
+| Yalnız FFN üçlü | 5.8M | 1.916 | +0.131 | 76.3K |
+| **FFN üçlü + rank 16 (`--arch bit`)** | 6.1M | **1.842** | **+0.057** | 73.1K |
+
+- Kalite kaybının çoğu karıştırıcı projeksiyonlarının bit olmasından geliyor. Bitleri FFN'de tutmak farkı yarıdan aza indiriyor.
+- Düşük-rank düzeltici, %25 genişletmeyle aynı kazancı çok daha az parametreyle veriyor.
+- İkili (gerçek 1-bit) üçlüden yalnızca 0.035 geride.
+- Sınırlar: küçük model, tek tohum; 0.03 civarı farklar gürültü olabilir. Ölçekle fark nasıl değişiyor bilinmiyor: `bash bench/bit_matrix2.sh gurultu` ve `bash bench/bit_matrix2.sh olcek`.
+
+```bash
+python -m heimdall.train --preset temel --arch bit --data ../stream_coder_100k.bin --tokens 2e9 --micro-batch 4 --no-compile --out runs/temel_bit
+```

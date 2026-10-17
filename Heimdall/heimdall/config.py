@@ -78,12 +78,14 @@ class HeimdallConfig:
 
 
 # Mimari türleri: aynı ön ayarın üç biçimi (adil karşılaştırma için aynı genişlik/derinlik)
-ARCHS = ("hibrit", "transformer", "sabit")
+ARCHS = ("hibrit", "transformer", "sabit", "bit")
 
 
 def apply_arch(cfg: HeimdallConfig, arch: str) -> HeimdallConfig:
     if arch == "hibrit":        # varsayılan: 3 DeltaNet + 1 global dikkat (NoPE)
         return replace(cfg, layout="DDDA", attn_window=0)
+    if arch == "bit":           # Heimdall-Bit: hibrit + FFN gizli ağırlıksız üçlü + yoğun düşük-rank düzeltici (GPU ölçümü: bench/)
+        return replace(cfg, layout="DDDA", attn_window=0, bits=2, bit_scope="ffn", bit_rank=16)
     if arch == "transformer":   # taban: her katman tam dikkat, RoPE, MHA
         return replace(cfg, layout="A", attn_window=0, attn_kv_heads=cfg.attn_heads)
     if arch == "sabit":         # global dikkat yok: çıkarım belleği bağlamdan bağımsız

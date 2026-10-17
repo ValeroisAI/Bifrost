@@ -50,7 +50,7 @@ def parse_args(argv=None):
     p.add_argument("--bit-rank", type=int, help="--bits: bit matrislere yoğun düşük-rank düzeltici (ör. 16)")
     p.add_argument("--bit-kernel", choices=["off", "int8"], default="off",
                    help="--bits: Triton int8 GEMM (eğitim/prefill). Önce bench/bitkernel.py ile hızı ölç")
-    p.add_argument("--flip-orani", type=float, default=2e-3, help="--bits: adım başına çevrilen ağırlık oranı (tepe)")
+    p.add_argument("--flip-orani", type=float, default=5e-3, help="--bits: adım başına çevrilen ağırlık oranı (tepe)")
     p.add_argument("--lr-muon", type=float)
     p.add_argument("--lr-adam", type=float)
     p.add_argument("--adamw-only", action="store_true")
