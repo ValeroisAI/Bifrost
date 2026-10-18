@@ -49,7 +49,7 @@ if HAS_TRITON:
                         mask=(offs_m[:, None] < M) & (kk[None, :] < K), other=0)
             b = tl.load(w_ptr + offs_n[None, :] * stride_wn + kk[:, None] * stride_wk,
                         mask=(offs_n[None, :] < N) & (kk[:, None] < K), other=0)
-            acc = tl.dot(a, b, acc)
+            acc += tl.dot(a, b, out_dtype=tl.int32)
         out = acc.to(tl.float32) * tl.load(sx_ptr + offs_m, mask=offs_m < M, other=0.0)[:, None]
         if HAS_SW:
             out = out * tl.load(sw_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
@@ -57,19 +57,22 @@ if HAS_TRITON:
                  mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
     @triton.jit
-    def _packed_mm_kernel(x_ptr, p_ptr, s_ptr, y_ptr, M, N, K,
+    def _packed_mm_kernel(x_ptr, p_ptr, s_ptr, y_ptr, M, N, K, k_chunk,
                           stride_xm, stride_xk, stride_pn, stride_ym, stride_yn,
-                          BITS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+                          BITS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                          SPLIT: tl.constexpr):
         PER: tl.constexpr = 8 // BITS
         offs_m = tl.program_id(0) * BM + tl.arange(0, BM)
         offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
         offs_k = tl.arange(0, BK)
+        k_lo = tl.program_id(2) * k_chunk                     # split-K: her program K'nin bir dilimini toplar
+        k_hi = tl.minimum(k_lo + k_chunk, K)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for k in range(0, K, BK):
+        for k in range(k_lo, k_hi, BK):
             kk = k + offs_k
             a = tl.load(x_ptr + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk,
-                        mask=(offs_m[:, None] < M) & (kk[None, :] < K), other=0.0)
-            kmask = (offs_n[None, :] < N) & (kk[:, None] < K)
+                        mask=(offs_m[:, None] < M) & (kk[None, :] < k_hi), other=0.0)
+            kmask = (offs_n[None, :] < N) & (kk[:, None] < k_hi)
             byte = tl.load(p_ptr + offs_n[None, :] * stride_pn + kk[:, None] // PER, mask=kmask, other=0).to(tl.int32)
             code = (byte >> ((kk[:, None] % PER) * BITS)) & ((1 << BITS) - 1)
             if BITS == 1:
@@ -79,8 +82,12 @@ if HAS_TRITON:
             w = tl.where(kmask, w, 0.0).to(a.dtype)
             acc = tl.dot(a, w, acc)
         out = acc * tl.load(s_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
-        tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn, out,
-                 mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+        ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        omask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        if SPLIT > 1:
+            tl.atomic_add(ptrs, out, mask=omask)
+        else:
+            tl.store(ptrs, out, mask=omask)
 
 
 def _tiles(m: int, decode: bool):
@@ -103,6 +110,15 @@ def int8_matmul(xq: torch.Tensor, w8: torch.Tensor, sx: torch.Tensor, sw: torch.
                           w8.stride(0), w8.stride(1), y.stride(0), y.stride(1),
                           HAS_SW=sw is not None, BM=bm, BN=bn, BK=bk, num_warps=warps)
     return y
+
+
+def int8_matmul_torch(xq: torch.Tensor, w8: torch.Tensor, sx: torch.Tensor) -> torch.Tensor:
+    """torch._int_mm (cuBLAS / hipBLASLt int8). M > 16 ve K, N 8'in katı ister; değilse dolgu yapılır."""
+    m, k = xq.shape
+    pm, pk = max(0, 17 - m), (-k) % 8
+    a = F.pad(xq, (0, pk, 0, pm)) if (pm or pk) else xq
+    b = F.pad(w8, (0, pk)) if pk else w8
+    return torch._int_mm(a, b.t().contiguous())[:m].float() * sx[:, None]
 
 
 def pack_weights(w: torch.Tensor, bits: int) -> torch.Tensor:
@@ -131,12 +147,21 @@ def packed_matmul(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, bi
     """x [M,K] (bf16/fp16/fp32), packed [N,·] uint8, scale [N] fp32 → [M,N] (x ile aynı dtype)."""
     m = x.size(0)
     n = packed.size(0)
-    y = torch.empty(m, n, device=x.device, dtype=x.dtype)
-    bm, bn, bk, warps = _tiles(m, m <= 32)
-    grid = (triton.cdiv(m, bm), triton.cdiv(n, bn))
-    _packed_mm_kernel[grid](x, packed, scale, y, m, n, k, x.stride(0), x.stride(1), packed.stride(0),
-                            y.stride(0), y.stride(1), BITS=bits, BM=bm, BN=bn, BK=bk, num_warps=warps)
-    return y
+    decode = m <= 32
+    bm, bn, bk, warps = _tiles(m, decode)
+    if decode:  # üretim: az çıktı programı var → K'yi böl, GPU'yu doldur (kısmi toplamlar atomik eklenir)
+        bn = 32
+        split = max(1, min(16, k // (2 * bk)))
+    else:
+        split = 1
+    k_chunk = triton.cdiv(triton.cdiv(k, split), bk) * bk
+    split = triton.cdiv(k, k_chunk)
+    y = torch.zeros(m, n, device=x.device, dtype=torch.float32) if split > 1 else \
+        torch.empty(m, n, device=x.device, dtype=x.dtype)
+    grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), split)
+    _packed_mm_kernel[grid](x, packed, scale, y, m, n, k, k_chunk, x.stride(0), x.stride(1), packed.stride(0),
+                            y.stride(0), y.stride(1), BITS=bits, BM=bm, BN=bn, BK=bk, SPLIT=split, num_warps=warps)
+    return y.to(x.dtype)
 
 
 # --------------------------------------------------------------------------- eğitim: int8 yolu
@@ -147,7 +172,12 @@ class _Int8BitFn(torch.autograd.Function):
     def forward(ctx, x2d, weight):
         sx = (x2d.detach().abs().amax(dim=-1).float() / 127.0).clamp(min=1e-8)
         xq = (x2d.detach().float() / sx[:, None]).round().clamp(-127, 127).to(torch.int8)
-        y = int8_matmul(xq.contiguous(), weight.detach().to(torch.int8).contiguous(), sx, None, x2d.dtype)
+        w8 = weight.detach().to(torch.int8).contiguous()
+        try:
+            y = int8_matmul(xq.contiguous(), w8, sx, None, x2d.dtype)
+        except Exception as e:  # Triton int8 dot bu GPU'da derlenmiyorsa hipBLASLt/cuBLAS int8
+            _warn_once("int8_triton", f"Triton int8 derlenmedi ({type(e).__name__}); torch._int_mm deneniyor")
+            y = int8_matmul_torch(xq, w8, sx).to(x2d.dtype)
         ctx.save_for_backward(x2d, weight)
         return y
 

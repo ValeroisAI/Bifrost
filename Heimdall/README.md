@@ -309,3 +309,21 @@ Tasarım ölçümle seçildi (`bench/bit_matrix.sh`, RX 9070 XT, d=192 L=8 hibri
 ```bash
 python -m heimdall.train --preset temel --arch bit --data ../stream_coder_100k.bin --tokens 2e9 --micro-batch 4 --no-compile --out runs/temel_bit
 ```
+
+### Hedef testi: N parametreli bit model ≥ N/2 parametreli yoğun model (`bench/hedef.sh`, RX 9070 XT)
+
+| Ölçek | Yoğun (yarı boyut) | `--arch bit` üçlü FFN | `--arch bit --bits 1` (ikili FFN) |
+|---|---|---|---|
+| Küçük, tohum 0 | 2.056 (3.1M) | 1.842 (6.1M) | 1.840 |
+| Küçük, tohum 1 | 1.937 | 1.764 | 1.752 |
+| Orta (10M token → 20M token) | 1.646 (23M) | 1.651 (46M) | — |
+
+- Küçük ölçekte bit model yarı boyuttaki yoğundan her iki tohumda da 0.17-0.21 nat iyi; tohumlar arası gürültü 0.08-0.12.
+- Orta ölçekte berabere (fark gürültü içinde). Hedef sınırda tutuyor; açık bir kazanç yok. Tek tohum, 20M token.
+- İkili FFN üçlüyle aynı kalitede (fark ≤ 0.01).
+- Bitler yalnız FFN'de; karıştırıcı ve embedding yoğun. Çıkarım belleği kazancı bu yüzden sınırlı.
+- Hız: bit eğitimi yoğundan %7-14 yavaş (73K'ya karşı 79-82K tok/s küçükte; 23K'ya karşı 27K tok/s ortada).
+
+### Çekirdek ölçümü (RX 9070 XT, ROCm 6.4, Triton ilk sürüm)
+Paketli 1-bit üretimde bf16'dan 1.4-1.9× hızlı, doğruluk hatası 0.0017. Prefill ve eğitim şekillerinde bf16'dan yavaş (0.3-0.8×): paketli çekirdek yalnız üretim içindir. Triton int8 `tl.dot` bu sürümde derlenmedi; `torch._int_mm` yedek yolu eklendi. Python 3.14'te `torch.compile` desteklenmiyor (Python 3.12 gerekir).
+

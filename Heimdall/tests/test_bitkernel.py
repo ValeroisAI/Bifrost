@@ -32,7 +32,7 @@ def test_int8_matmul_exact():
 def test_packed_matmul():
     torch.manual_seed(1)
     for bits, vals in ((1, [-1.0, 1.0]), (2, [-1.0, 0.0, 1.0])):
-        for m, k, n in ((1, 200, 70), (5, 131, 33), (40, 64, 100)):
+        for m, k, n in ((1, 200, 70), (5, 131, 33), (40, 64, 100), (1, 1024, 40), (3, 777, 50)):
             w = torch.tensor(vals)[torch.randint(0, len(vals), (n, k))]
             x, s = torch.randn(m, k), torch.rand(n) + 0.5
             ref = (x @ w.t()) * s
