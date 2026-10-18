@@ -79,6 +79,7 @@ class BitFlip(torch.optim.Optimizer):
     def __init__(self, params, lr: float = 2e-3, momentum: float = 0.9, sample: int = 16384) -> None:
         super().__init__(params, dict(lr=lr, momentum=momentum, sample=sample))
         self.last_flip_frac = 0.0
+        self._idx = {}   # kuantil örnek indeksleri: optimizer durumuna KOYMA (load_state_dict tamsayı tensörü bf16'ya çevirir)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -91,19 +92,21 @@ class BitFlip(torch.optim.Optimizer):
                 st = self.state[p]
                 if "m" not in st:
                     st["m"] = torch.zeros_like(p)
-                    st["idx"] = torch.randint(0, p.numel(), (min(group["sample"], p.numel()),), device=p.device)
+                if id(p) not in self._idx:
+                    self._idx[id(p)] = torch.randint(0, p.numel(), (min(group["sample"], p.numel()),), device=p.device)
+                idx = self._idx[id(p)]
                 mf = st["m"].float().mul_(beta).add_(p.grad.float(), alpha=1 - beta)
                 if rate > 0:
                     r = mf / (mf.square().mean(dim=1, keepdim=True).sqrt() + 1e-12)   # satır başına normalize
                     pf = p.float()
                     if p.bit == 1:
                         score = (pf * r).clamp(min=0)          # gradyan şu anki işaretin tersine itiyor
-                        thr = torch.quantile(score.flatten()[st["idx"]], 1.0 - rate).clamp(min=1e-12)
+                        thr = torch.quantile(score.flatten()[idx], 1.0 - rate).clamp(min=1e-12)
                         new = torch.where(score > thr, -pf, pf)
                     else:
                         # yalnız hareket edebilenler yarışır: +1'i yukarı, −1'i aşağı iten momentum bütçe harcamaz
                         score = torch.where(((pf >= 1) & (r < 0)) | ((pf <= -1) & (r > 0)), 0.0, r.abs())
-                        thr = torch.quantile(score.flatten()[st["idx"]], 1.0 - rate).clamp(min=1e-12)
+                        thr = torch.quantile(score.flatten()[idx], 1.0 - rate).clamp(min=1e-12)
                         new = (pf - torch.sign(r) * (score > thr)).clamp(-1, 1)
                     changed = new != pf
                     p.copy_(new.to(p.dtype))

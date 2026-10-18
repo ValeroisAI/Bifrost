@@ -78,6 +78,33 @@ def test_scope_and_rank():
             assert any(p.abs().sum() > 0 for n, p in m.named_parameters() if n.endswith("lr_u"))
 
 
+def test_optimizer_state_roundtrip():
+    """Kayıt → yükleme → sürdürme (gece koşusunun çökme sonrası devamı)."""
+    for bits in (1, 2):
+        torch.manual_seed(5)
+        m = HeimdallLM(replace(BASE, bits=bits, bit_rank=4))
+        opts = build_optimizers(m, 0.02, 3e-3, flip_rate=0.01)
+        ids = torch.randint(0, 300, (4, 33))
+
+        def step():
+            m(ids[:, :-1], ids[:, 1:]).backward()
+            for o in opts:
+                o.step(); o.zero_grad(set_to_none=True)
+
+        for _ in range(3):
+            step()
+        saved = {"model": m.state_dict(), "optim": [o.state_dict() for o in opts]}
+        m2 = HeimdallLM(replace(BASE, bits=bits, bit_rank=4))
+        m2.load_state_dict(saved["model"])
+        opts2 = build_optimizers(m2, 0.02, 3e-3, flip_rate=0.01)
+        for o, st in zip(opts2, saved["optim"]):
+            o.load_state_dict(st)
+        m, opts = m2, opts2
+        for _ in range(3):
+            step()                                  # IndexError vermemeli
+        assert opts[-1].last_flip_frac >= 0
+
+
 def test_memory_per_param():
     m = HeimdallLM(replace(BASE, bits=1))
     n = sum(x.weight.numel() for x in m.modules() if isinstance(x, BitLinear))
@@ -85,6 +112,6 @@ def test_memory_per_param():
 
 
 if __name__ == "__main__":
-    for fn in (test_values_and_learning, test_cache_equals_full, test_scope_and_rank, test_memory_per_param):
+    for fn in (test_values_and_learning, test_cache_equals_full, test_scope_and_rank, test_optimizer_state_roundtrip, test_memory_per_param):
         fn()
         print("OK ", fn.__name__)
