@@ -316,7 +316,8 @@ python -m heimdall.train --preset temel --arch bit --data ../stream_coder_100k.b
 |---|---|---|---|
 | Küçük, tohum 0 | 2.056 (3.1M) | 1.842 (6.1M) | 1.840 |
 | Küçük, tohum 1 | 1.937 | 1.764 | 1.752 |
-| Orta (10M token → 20M token) | 1.646 (23M) | 1.651 (46M) | — |
+| Orta, 20M token (iki koşu: derlemesiz / derlemeli) | 1.646 / 1.635 (23M) | 1.651 / 1.656 (46M) | — |
+| **Temel, 40M token (derlemeli)** | **1.309 (52M)** | 1.330 (98M) | — |
 
 - Küçük ölçekte bit model yarı boyuttaki yoğundan her iki tohumda da 0.17-0.21 nat iyi; tohumlar arası gürültü 0.08-0.12.
 - Orta ölçekte berabere (fark gürültü içinde). Hedef sınırda tutuyor; açık bir kazanç yok. Tek tohum, 20M token.
@@ -326,4 +327,8 @@ python -m heimdall.train --preset temel --arch bit --data ../stream_coder_100k.b
 
 ### Çekirdek ölçümü (RX 9070 XT, ROCm 6.4, Triton ilk sürüm)
 Paketli 1-bit üretimde bf16'dan 1.4-1.9× hızlı, doğruluk hatası 0.0017. Prefill ve eğitim şekillerinde bf16'dan yavaş (0.3-0.8×): paketli çekirdek yalnız üretim içindir. Triton int8 `tl.dot` bu sürümde derlenmedi; `torch._int_mm` yedek yolu eklendi. Python 3.14'te `torch.compile` desteklenmiyor (Python 3.12 gerekir).
+
+**Dürüst değerlendirme (RX 9070 XT, ROCm 10.1, torch 2.14, torch.compile açık).** Bit modelin yarı boyutlu yoğun modele üstünlüğü ölçekle eriyor: küçükte 0.17-0.21 nat önde, ortada berabere, 100M'de 0.022 geride. Hedef (N parametreli bit ≥ N/2 yoğun) bu ölçekte tutmuyor. Eğitimde bit modeli %15 yavaş ve %36 daha çok bellek kullanıyor (100M: 47K vs 56K tok/s, 13.3 vs 9.8 GB). Çıkarımda yalnız FFN paketlenebildiği için bellek, yarı boyutlu yoğunla aşağı yukarı aynı (hesap, ölçülmedi). Veri 25.6M token olduğu için 100M ölçekte modeller veri kısıtlı; sonuç ancak daha çok veriyle kesinleşir.
+
+`torch.compile` Python 3.14 + torch 2.14 + ROCm 10.1'de çalışıyor: 5.8M yoğun model 90K → 264K tok/s, bellek 3.1 → 1.3 GB, val loss değişmedi.
 
