@@ -176,6 +176,7 @@ def main(argv=None) -> None:
     loader = Loader(mix, micro, seq_len, device)
     model.train()
     t0, tok0 = time.time(), 0
+    bad = False
     try:
         while step < total:
             progress = step / total
@@ -187,6 +188,9 @@ def main(argv=None) -> None:
                     loss = train_model(x, y)
                 (loss / accum).backward()
                 loss_acc += loss.detach().float() / accum
+            if not math.isfinite(float(loss_acc)):  # eğitim bozuldu: bozuk ağırlığı kaydetme, süreci düşür (gece betiği son iyi kayıttan sürdürür)
+                bad = True
+                raise FloatingPointError(f"adım {step}: kayıp sonlu değil ({float(loss_acc)})")
             gnorm = torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             for opt in optimizers:
                 opt.step()
@@ -224,8 +228,9 @@ def main(argv=None) -> None:
         print("\nDurduruldu, kaydediliyor...")
     finally:
         loader.stop = True
-        save()
-        print(f"Kaydedildi: {out / 'last.pt'} (adım {step}, {tokens / 1e6:,.0f}M token)", flush=True)
+        if not bad:
+            save()
+        print(f"{'KAYDEDİLMEDİ (bozuk durum)' if bad else 'Kaydedildi'}: {out / 'last.pt'} (adım {step}, {tokens / 1e6:,.0f}M token)", flush=True)
 
 
 if __name__ == "__main__":

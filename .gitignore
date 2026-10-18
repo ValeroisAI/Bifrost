@@ -12,3 +12,8 @@ checkpoints*/
 ESKI/08_BIFROST_H/data/
 ESKI/08_BIFROST_H/results/**/*.log
 ESKI/08_BIFROST_H/results/**/*.pt
+
+# Heimdall çalışma çıktıları
+Heimdall/runs/
+Heimdall/veri/
+Heimdall/*.log
