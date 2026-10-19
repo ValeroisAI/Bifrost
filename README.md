@@ -9,6 +9,8 @@ Heimdall is a from-scratch research codebase (PyTorch, ROCm/CUDA) containing:
 3. **Bifrost** — a method that converts a pretrained open Transformer (Llama/Qwen/SmolLM family) into a constant-memory model by training only ~2 % new parameters.
 4. **Triton kernels** for int8 and packed 1/2-bit matrix products, and an **OpenAI-compatible inference server** (continuous batching, API keys, rate limits, Prometheus metrics; unit-tested, not load-tested).
 
+![Heimdall-Bit architecture](docs/architecture.svg)
+
 Everything below was measured on one workstation: **AMD Radeon RX 9070 XT (16 GB, gfx1201) + Ryzen 7 7800X3D, Python 3.14.** Later results use ROCm 10.1.0 / PyTorch 2.14.0; the design study (§3) and the first small-scale comparison ran earlier on ROCm 6.4 / PyTorch 2.9.1 in eager mode. Unless stated otherwise, comparisons are single runs (one seed), so differences of ~0.03 nats or less should be treated as noise.
 
 > **License:** source-available for review only (read, evaluate, and run unmodified to verify reported results); no usage rights are granted at this time. See [`LICENSE`](LICENSE).
