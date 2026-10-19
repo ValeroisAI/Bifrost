@@ -11,7 +11,7 @@ Heimdall is a from-scratch research codebase (PyTorch, ROCm/CUDA) containing:
 
 Everything below was measured on one workstation: **AMD Radeon RX 9070 XT (16 GB, gfx1201) + Ryzen 7 7800X3D, Python 3.14.** Later results use ROCm 10.1.0 / PyTorch 2.14.0; the design study (§3) and the first small-scale comparison ran earlier on ROCm 6.4 / PyTorch 2.9.1 in eager mode. Unless stated otherwise, comparisons are single runs (one seed), so differences of ~0.03 nats or less should be treated as noise.
 
-> **License:** all rights reserved; the repository is source-available for review (see [`LICENSE`](LICENSE)).
+> **License:** source-available for review only (read, evaluate, and run unmodified to verify reported results); no usage rights are granted at this time. See [`LICENSE`](LICENSE).
 
 ---
 
