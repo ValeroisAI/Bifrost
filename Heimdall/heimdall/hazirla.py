@@ -40,8 +40,9 @@ def main() -> None:
     limit = int(args.max_token)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")       # yarım kalan dosya "hazır" sayılmasın: bitince yeniden adlandırılır
     total, docs, t0 = 0, 0, time.time()
-    with open(out, "wb") as f:
+    with open(tmp, "wb") as f:
         for path in args.dosya:
             print(f"indiriliyor: {args.repo}/{path}", flush=True)
             local = hf_hub_download(args.repo, path, repo_type="dataset")
@@ -66,6 +67,7 @@ def main() -> None:
                     break
             if total >= limit:
                 break
+    tmp.replace(out)
     data = np.memmap(out, dtype=np.uint16, mode="r")
     print(f"Yazıldı: {out} — {len(data) / 1e6:,.1f}M token, {docs:,} belge, {time.time() - t0:.0f} sn")
     mid = len(data) // 2
