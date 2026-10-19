@@ -1,5 +1,5 @@
 """
-donustur.py — Hazır bir Transformer'ı (Llama / Qwen2 / Qwen3 / SmolLM ailesi) sabit bellekli modele dönüştürür.
+donustur.py — Hazır bir Transformer'ı (Llama / Qwen2 / Qwen3 / SmolLM ailesi, BitNet b1.58) sabit bellekli modele dönüştürür.
 
 Fikir: 1000 kat hesap farkını sıfırdan eğitimle kapatamayız, ama o hesap açık ağırlıklarda zaten harcanmış.
 Her dikkat katmanı şu katmana dönüştürülür (öğretmenin q/k/v/o ağırlıkları aynen kullanılır):
@@ -51,6 +51,13 @@ class TeacherConfig:
         self.tie = hf.get("tie_word_embeddings", False)
         self.qk_norm = hf.get("model_type") == "qwen3"
         self.attn_bias = hf.get("attention_bias", hf.get("model_type") == "qwen2")
+        # BitNet b1.58: üçlü ağırlık + 8-bit aktivasyon, relu² FFN, dikkat/FFN çıkışından önce ek RMSNorm (sub-norm)
+        self.bitnet = hf.get("model_type") == "bitnet"
+        if self.bitnet and (hf.get("quantization_config") or {}).get("quantization_mode", "online") != "online":
+            raise NotImplementedError("BitNet: yalnız bf16 ana ağırlıklı ('online') sürüm destekleniyor (ör. -bf16 reposu)")
+        if hf.get("hidden_act", "silu") not in ("silu", "relu2"):
+            raise NotImplementedError(f"aktivasyon {hf['hidden_act']} desteklenmiyor")
+        self.act = hf.get("hidden_act", "silu")
         if hf.get("rope_scaling"):
             raise NotImplementedError("rope_scaling henüz desteklenmiyor")
 
@@ -102,6 +109,27 @@ class Q4Linear(nn.Module):
         return F.linear(x, self.dequant(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
 
 
+class TernaryLinear(nn.Module):
+    """Donuk BitNet b1.58 doğrusal katmanı (transformers AutoBitLinear 'online' ile aynı hesap): ağırlık tensör başına
+    absmean ölçekli {−1,0,+1}, girdi token başına absmax 8-bit. Ağırlık int8 tutulur (bf16'nın yarısı)."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        w = weight.float()
+        mean_abs = w.abs().mean().clamp(min=1e-5)
+        self.register_buffer("wq", (w / mean_abs).round().clamp(-1, 1).to(torch.int8))
+        self.register_buffer("w_scale", mean_abs.reshape(1))
+        self.out_features, self.in_features = w.shape
+        self.bias = None
+
+    def forward(self, x):
+        xf = x.float()
+        s = 127 / xf.abs().amax(-1, keepdim=True).clamp(min=1e-5)
+        xq = (xf * s).round().clamp(-128, 127) / s
+        xq = (xf + (xq - xf).detach()).to(x.dtype)        # düz-geçiş (STE): yeni parametrelere gradyan akar
+        return F.linear(xq, self.wq.to(x.dtype)) * self.w_scale.to(x.dtype)
+
+
 class ConvAttention(nn.Module):
     def __init__(self, tc: TeacherConfig) -> None:
         super().__init__()
@@ -113,6 +141,7 @@ class ConvAttention(nn.Module):
         if tc.qk_norm:
             self.q_norm = RMSNorm(self.dh, tc.eps)
             self.k_norm = RMSNorm(self.dh, tc.eps)
+        self.attn_sub_norm = RMSNorm(self.h * self.dh, tc.eps) if tc.bitnet else nn.Identity()
         self.converted = False
         self.mode = "teacher"          # teacher | student | layer (aşama A) | window (yalnız pencere, karşılaştırma)
         self.aux = None
@@ -140,7 +169,7 @@ class ConvAttention(nn.Module):
 
     def new_params(self):
         return [p for n, p in self.named_parameters() if not n.startswith(("q_proj", "k_proj", "v_proj", "o_proj",
-                                                                           "q_norm", "k_norm"))]
+                                                                           "q_norm", "k_norm", "attn_sub_norm"))]
 
     def _qkv(self, x, start: int = 0):
         b, t, _ = x.shape
@@ -278,7 +307,7 @@ class ConvAttention(nn.Module):
             else:
                 assert t == 1, "dönüşüm cache'i: prefill tek parça, sonra token token"
                 o = self._step(x, cache, start)
-            return self.o_proj(o.reshape(b, t, -1).to(x.dtype))
+            return self.o_proj(self.attn_sub_norm(o.reshape(b, t, -1).to(x.dtype)))
         q, k, v, qr, kr = self._qkv(x)
         if not self.converted or self.mode == "teacher":
             o = self._full(qr, kr, v)
@@ -289,7 +318,7 @@ class ConvAttention(nn.Module):
             self.aux = (o_s - o.float()).square().mean() / o.float().square().mean().clamp(min=1e-8)
         else:
             o = self._hybrid(x, q, k, v, qr, kr, memory=self.mode == "student")
-        return self.o_proj(o.reshape(b, t, -1).to(x.dtype))
+        return self.o_proj(self.attn_sub_norm(o.reshape(b, t, -1).to(x.dtype)))
 
 
 class Layer(nn.Module):
@@ -301,11 +330,13 @@ class Layer(nn.Module):
         self.gate_proj = nn.Linear(tc.d, tc.inter, bias=False)
         self.up_proj = nn.Linear(tc.d, tc.inter, bias=False)
         self.down_proj = nn.Linear(tc.inter, tc.d, bias=False)
+        self.ffn_sub_norm = RMSNorm(tc.inter, tc.eps) if tc.bitnet else nn.Identity()
+        self.act = (lambda z: F.relu(z).square()) if tc.act == "relu2" else F.silu
 
     def forward(self, x, cache=None, start: int = 0):
         x = x + self.self_attn(self.input_layernorm(x), cache, start)
         h = self.post_attention_layernorm(x)
-        return x + self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h))
+        return x + self.down_proj(self.ffn_sub_norm(self.act(self.gate_proj(h)) * self.up_proj(h)))
 
 
 class ConvLM(nn.Module):
@@ -339,7 +370,13 @@ class ConvLM(nn.Module):
                     mod = mods[mod_name]
                     quant = q4 and isinstance(mod, nn.Linear) and (mod_name.startswith("layers.") or
                                                                   (mod_name == "lm_head" and not model.tc.tie))
-                    if quant and attr == "weight":
+                    if model.tc.bitnet and isinstance(mod, nn.Linear) and mod_name.startswith("layers."):
+                        assert attr == "weight", key
+                        q = TernaryLinear(t)
+                        parent, child = mod_name.rsplit(".", 1)
+                        setattr(mods[parent], child, q)
+                        mods[mod_name] = q
+                    elif quant and attr == "weight":
                         # Q4_K_M gibi: en hassas matrisler (v_proj, down_proj) daha yüksek bitte
                         bits = sensitive_bits if mod_name.endswith(("v_proj", "down_proj")) else 4
                         q = Q4Linear(t, group, bits=bits)
@@ -362,7 +399,8 @@ class ConvLM(nn.Module):
 
     def n_params(self) -> int:
         return sum(q.numel() for q in self.parameters()) + sum(
-            m.packed.numel() * (2 if m.bits == 4 else 1) for m in self.modules() if isinstance(m, Q4Linear))
+            m.packed.numel() * (2 if m.bits == 4 else 1) for m in self.modules() if isinstance(m, Q4Linear)) + sum(
+            m.wq.numel() for m in self.modules() if isinstance(m, TernaryLinear))
 
     def convert(self, window: int = 64, sinks: int = 4, archival_frac: float = 0.25, keep_global=()) -> None:
         for i, layer in enumerate(self.layers):
@@ -507,6 +545,13 @@ def verify_against_hf(model_name: str, n_tokens: int = 128) -> float:
     ref = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).eval()(ids).logits
     ours = ConvLM.from_pretrained(path).eval()(ids)
     err = (ref - ours).abs().max().item()
+    if json.loads((Path(path) / "config.json").read_text()).get("model_type") == "bitnet":
+        # 8-bit aktivasyon yuvarlaması süreksiz: 1e-6'lık toplama sırası farkı bile bazı basamakları çevirir ve 30 katmanda
+        # büyür (kendi modelimize 1e-6 gürültü: logit farkı ~1.5, NLL farkı ~0.003). Ölçüt: tahmin uyuşması.
+        agree = (ref.argmax(-1) == ours.argmax(-1)).float().mean().item()
+        print(f"{model_name}: argmax uyuşması {agree:.3f}, en büyük logit farkı {err:.2e} → "
+              f"{'AYNI (aktivasyon yuvarlaması sınırında)' if agree > 0.8 else 'FARKLI'}")
+        return err
     print(f"{model_name}: en büyük logit farkı {err:.2e} (logit ölçeği {ref.abs().max().item():.1f}) → "
           f"{'BİREBİR AYNI' if err < 1e-3 * ref.abs().max().item() else 'FARKLI: bu model desteklenmiyor'}")
     return err
