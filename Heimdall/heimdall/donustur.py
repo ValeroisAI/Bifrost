@@ -109,6 +109,22 @@ class Q4Linear(nn.Module):
         return F.linear(x, self.dequant(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
 
 
+class _TernaryMM(torch.autograd.Function):
+    """x · Wᵀ, W = int8 üçlü. Geri yayılım için açılmış ağırlık kopyası SAKLANMAZ, int8'den yeniden açılır
+    (2.4B öğretmende ~4-8 GB tasarruf). Ağırlığa gradyan yok (donuk öğretmen)."""
+
+    @staticmethod
+    def forward(ctx, x, wq):
+        ctx.save_for_backward(wq)
+        ctx.x_dtype = x.dtype
+        return F.linear(x, wq.to(x.dtype))
+
+    @staticmethod
+    def backward(ctx, g):
+        (wq,) = ctx.saved_tensors
+        return (g @ wq.to(g.dtype)).to(ctx.x_dtype), None
+
+
 class TernaryLinear(nn.Module):
     """Donuk BitNet b1.58 doğrusal katmanı (transformers AutoBitLinear 'online' ile aynı hesap): ağırlık tensör başına
     absmean ölçekli {−1,0,+1}, girdi token başına absmax 8-bit. Ağırlık int8 tutulur (bf16'nın yarısı)."""
@@ -127,7 +143,11 @@ class TernaryLinear(nn.Module):
         s = 127 / xf.abs().amax(-1, keepdim=True).clamp(min=1e-5)
         xq = (xf * s).round().clamp(-128, 127) / s
         xq = (xf + (xq - xf).detach()).to(x.dtype)        # düz-geçiş (STE): yeni parametrelere gradyan akar
-        return F.linear(xq, self.wq.to(x.dtype)) * self.w_scale.to(x.dtype)
+        if torch.is_autocast_enabled(x.device.type):
+            xq = xq.to(torch.get_autocast_dtype(x.device.type))
+        with torch.autocast(x.device.type, enabled=False):
+            y = _TernaryMM.apply(xq, self.wq)
+        return y * self.w_scale.to(y.dtype)
 
 
 class ConvAttention(nn.Module):
@@ -474,9 +494,9 @@ class ConvLM(nn.Module):
 
 
 # --------------------------------------------------------------------------- veri ve ölçüm
-def eval_windows(path, t: int, n: int, sep: int):
+def eval_windows(path, t: int, n: int, sep: int, dtype=np.uint16):
     """Makale başından başlayan, en az t+1 uzunluklu pencereler (bağlam gerçekten büyür)."""
-    data = np.fromfile(path, dtype=np.uint16).astype(np.int64)
+    data = np.fromfile(path, dtype=dtype).astype(np.int64)
     starts = [0] + [i + 1 for i in np.nonzero(data == sep)[0][:-1]]
     ends = list(np.nonzero(data == sep)[0])
     wins = [torch.from_numpy(data[s:s + t + 1]) for s, e in zip(starts, ends) if e - s > t]
@@ -622,10 +642,11 @@ def main() -> None:
           f"{kv_teacher(8192) / 2**20:.0f} MB, 1M'de {kv_teacher(2**20) / 2**30:.1f} GB → dönüşüm {state / 2**20:.1f} MB (sabit)",
           flush=True)
 
-    wins = eval_windows(args.test, args.eval_len, args.eval_n, args.sep).to(device)
+    tok_dtype = np.uint16 if model.tc.vocab < 65536 else np.uint32     # prepare_wikitext ile aynı kural
+    wins = eval_windows(args.test, args.eval_len, args.eval_n, args.sep, tok_dtype).to(device)
     L = args.eval_len
     buckets = [(a, min(b, L)) for a, b in ((0, args.window), (args.window, 256), (256, 1024), (1024, L)) if a < min(b, L)]
-    data = np.memmap(args.train, dtype=np.uint16 if model.tc.vocab < 65536 else np.uint32, mode="r")
+    data = np.memmap(args.train, dtype=tok_dtype, mode="r")
     rng = np.random.default_rng(0)
 
     def batch():
