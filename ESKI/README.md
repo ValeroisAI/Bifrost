@@ -1,3 +1,7 @@
+> **Legacy archive (English note).** This folder holds earlier, superseded research (Bifrost CSL, V-PDM, Kuzgun, Valkir, Kuyu) written in Turkish. The active project is [`Heimdall/`](../Heimdall/README.md); see the [root README](../README.md). Nothing here is referenced by the results reported there.
+
+---
+
 # 🏛️ VALEROIS MİMARİ VE KOD PAKETİ (USB LAB KİTİ)
 
 Bu klasör, Valerois projesinin tüm kritik kodlarını, mimari katmanlarını, tokenizer'larını, **Bifrost CSL (Continuous Causal State Convolutions)** motorunu ve dün gece tartıştığımız yepyeni **V-PDM (Predictive Delta Memory)** mimarisini içerir.

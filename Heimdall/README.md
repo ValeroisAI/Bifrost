@@ -1,334 +1,169 @@
 # Heimdall
 
-Valerois AI dil modeli: mimari, eğitim sistemi ve OpenAI uyumlu servis. Aynı kod NVIDIA (CUDA) ve AMD (ROCm) GPU'larda, ayrıca CPU'da çalışır.
+A research codebase for efficient language-model training and inference on consumer GPUs (AMD ROCm and NVIDIA CUDA; CPU for tests). Summary of results and limitations: see the [repository README](../README.md). This document describes the design, the tools, and how to reproduce every number.
 
-> Heimdall, Bifröst köprüsünün bekçisidir: çok uzağı görür ve hiçbir şeyi unutmaz.
+> Heimdall guards the Bifröst bridge: it sees far and forgets nothing.
 
-**Durum:** Kod CPU'da test edildi (`tests/`, 5/5). Eğitim, paketleme, yükleme ve API zinciri uçtan uca çalıştı. GPU'da henüz koşulmadı. "Transformer'ı geçiyor" iddiası literatüre dayanıyor; bizim verimizde **ölçülmedi**. Ölçüm tek komutla yapılır, bkz. [Transformer ile karşılaştırma](#transformer-ile-karşılaştırma-kanıt-prosedürü).
+**Status.** All components run end-to-end on an AMD RX 9070 XT (ROCm 10.1, PyTorch 2.14, Python 3.14) and on CPU. 16 unit tests pass on CPU. The largest model trained from scratch is 98 M parameters / 0.8 B tokens.
+
+**CLI glossary** (flag and script names are Turkish): `hibrit` hybrid · `sabit` fixed(-memory) · `gece` overnight · `hafta` week · `hedef` target · `boyut` size · `uret` generate · `hazirla` prepare (data) · `donustur` convert · `karsilastir` compare · `veri` data · `kosu` run · `kucuk/orta/temel/buyuk` small/medium/base/large · `--flip-orani` flip rate · `--hassas-bit` sensitive-matrix bits.
 
 ---
 
-## 1. Mimari
+## 1. Architecture
 
 ```
-girdi → Embedding ─┬─ [ D ] Gated DeltaNet ─┐
-                   ├─ [ D ] Gated DeltaNet  │  × (n_layers / 4)
-                   ├─ [ D ] Gated DeltaNet  │  her katmandan sonra SwiGLU FFN
-                   └─ [ A ] Global dikkat ──┘  (pre-RMSNorm, artık bağlantı)
-                 → RMSNorm → LM başı (embedding ile ortak) → softcap(30)
+tokens → Embedding ─┬─ [D] Gated DeltaNet ─┐
+                    ├─ [D] Gated DeltaNet   │  × (n_layers / 4), each layer followed by a SwiGLU FFN
+                    ├─ [D] Gated DeltaNet   │  (pre-RMSNorm, residual connections)
+                    └─ [A] Global attention ┘
+                  → RMSNorm → tied LM head → logit soft-cap (30)
 ```
+Three of every four layers are **Gated DeltaNet**, one is **global attention** (`layout="DDDA"`).
 
-Katmanların dörtte üçü **Gated DeltaNet**, dörtte biri **global dikkattir** (`layout="DDDA"`).
-
-### D: Gated DeltaNet (doğrusal zamanlı hafıza)
+### D — Gated DeltaNet (linear-time, fixed-size memory)
 ```
-[q;k;v] = SiLU(ShortConv₄(W x))          q̂ = q/‖q‖·d^-½,  k̂ = k/‖k‖
-α = exp(−e^A · softplus(W_a x + dt))      β = σ(W_b x)
-S_t = α S_{t-1} + β k̂ (v − α S_{t-1}ᵀ k̂)ᵀ      o_t = S_tᵀ q̂
+[q;k;v] = SiLU(ShortConv4(W x))         q̂ = q/‖q‖·d^-½,  k̂ = k/‖k‖
+α = exp(−e^A · softplus(W_a x + dt))     β = σ(W_b x)
+S_t = α S_{t-1} + β k̂ (v − α S_{t-1}ᵀ k̂)ᵀ        o_t = S_tᵀ q̂
 y = W_o( RMSNorm(o) ⊙ SiLU(W_g x) )
 ```
-- Hafıza `S` sabit boyutlu bir matristir (kafa başına 128×128). Bağlam uzadıkça büyümez.
-- **Delta kuralı:** aynı anahtara yeni değer gelince eskisi silinir ("proje id 1 → 2 → 3" sorusunda cevap 3). Salt toplamsal doğrusal dikkatin (Mamba, RetNet) yapamadığı "üzerine yazma" budur.
-- **Arşiv kafaları (α ≡ 1):** kafaların bir kısmı hiç unutmaz. Önceki deneylerimizde öğrenilen unutma katsayısı 0.99997 çıktı; bu değerle 65K tokende bilginin %88'i siliniyordu. α=1 kafaları bunu düzeltti.
-- Eğitimde chunk-paralel çalışır (UT dönüşümü, O(T·C·d)), üretimde token başına sabit iş yapar.
+- The memory `S` is a fixed-size matrix (128×128 per head); it does not grow with context.
+- **Delta rule:** writing a new value to an existing key erases the old one ("id: 1 → 2 → 3" answers 3), which purely additive linear attention cannot do.
+- **Archival heads (α ≡ 1):** some heads never forget. In earlier experiments the learned forgetting gate converged to 0.99997, which erased ~88 % of stored information over 65 K tokens; archival heads fixed this.
+- Training uses the chunk-parallel form (UT transform, O(T·C·d)); generation does constant work per token. A Triton kernel from `flash-linear-attention` is used when installed, after a start-up self-test against the PyTorch reference.
 
-### A: Global dikkat
-- **GQA** (12 sorgu, 4 KV kafası): KV cache 3 kat küçük.
-- **QK-norm:** büyük öğrenme hızında kararlılık.
-- **Çıkış kapısı:** `y = W_o(SDPA(q,k,v) ⊙ σ(W_gate x))`. Qwen3-Next'te dikkat batağını (attention sink) ve aktivasyon patlamalarını azaltıyor.
-- **NoPE:** hibritte dikkat katmanları konum kodlaması kullanmaz; sıra bilgisini DeltaNet ve conv taşır (Kimi Linear ile aynı tercih). Eğitim uzunluğunun ötesine genelleme için RoPE'nin frekans sınırı ortadan kalkar.
-- Çekirdek: PyTorch SDPA. CUDA'da FlashAttention, ROCm'da AOTriton kullanılır.
+### A — Global attention
+GQA (12 query / 4 KV heads), QK-norm, sigmoid output gate, **no positional encoding (NoPE)** in the hybrid (order information is carried by the DeltaNet layers and the short convolutions). Uses PyTorch SDPA (FlashAttention on CUDA, AOTriton on ROCm).
 
-### Neden Transformer'ı geçmesi beklenir?
-| Kanıt | Sonuç |
-|---|---|
-| Gated DeltaNet (Yang ve ark., ICLR 2025) | 1.3B / 100B token: hibrit GDN + dikkat, Transformer++, Mamba2 ve saf GDN'den daha iyi LM ve hatırlama skoru |
-| Qwen3-Next (2025) | 3 Gated DeltaNet : 1 kapılı dikkat (MoE ile birlikte). Dense Qwen3-32B'nin %10'undan az eğitim maliyetiyle benzer/üstün kalite, 32K+ bağlamda ~10× verim |
-| Kimi Linear (2025) | 3 KDA (delta ailesi) : 1 NoPE global dikkat. Kısa bağlam, uzun bağlam ve RL'de tam dikkati geçiyor; KV cache %75 küçük |
-| Bizim ölçümümüz (CPU, `08_BIFROST_H/DURUM.md`) | Global dikkatsiz Kuzgun, eşit sürede Transformer'ın gerisinde kaldı. Bu yüzden 1/4 global dikkat geri eklendi |
-
-Kısaca: saf doğrusal modeller kopyalama ve tam hatırlamada Transformer'a yeniliyor. Az sayıda global dikkat katmanı bu açığı kapatıyor. DeltaNet katmanları ise hem daha güçlü bir kısa-orta menzil karıştırıcısı hem de ucuz uzun hafıza sağlıyor.
-
-### Bellek ve hız (temel ön ayar, ~100M, bf16, dizi başına)
-| Bağlam | Transformer (MHA, 12 dikkat katmanı) | **Heimdall hibrit** | Heimdall `sabit` |
-|---|---|---|---|
-| KV/durum, 4K token | 151 MB | **16 MB** | 7 MB |
-| KV/durum, 32K token | 1.21 GB | **104 MB** | 7 MB |
-| KV/durum, 128K token | 4.83 GB | **406 MB** | 7 MB |
-| Eğitim hesabı, T=8K | karesel × 12 katman | karesel × 3 katman + doğrusal × 9 | doğrusal |
-
-Bellek sınırı KV cache olduğunda, aynı 16 GB'lık kartta ~12 kat daha fazla eşzamanlı kullanıcı ya da ~12 kat daha uzun bağlam demektir. Prefill parçalı yapılır (`--prefill-chunk`), bu yüzden uzun istemde karesel bellek patlaması olmaz.
-
-### Ölçüm: bağlam içi hatırlama (MQAR, `bench/mqar.py`)
-Dizinin başında 8 anahtar→değer çifti veriliyor, bazıları güncelleniyor; araya boşluk konuyor, sonra anahtarlar soruluyor. Eğitimde boşluk en fazla 64 token. ~100K parametre, 2 katman, CPU'da 8 dakika:
-
-| Model | boşluk 64 | 1.024 | 16.384 |
-|---|---|---|---|
-| Saf dikkat (Transformer) | %15.6 | %3.5 | %0.8 |
-| Saf Gated DeltaNet | %14.5 | %14.8 | %14.8 |
-| **Hibrit (1 DeltaNet + 1 dikkat)** | **%99.9** | **%100** | **%100** |
-
-Aynı bütçede ne saf dikkat ne saf delta görevi öğrendi; hibrit öğrendi ve eğitimde gördüğünün 256 katı uzaklığa genelledi. Tek tohum, küçük ölçek. Büyük modelde tekrar ölçülmeli.
-
-### Mimari türleri
-| `--arch` | Düzen | Kullanım |
+### Variants (`--arch`)
+| `--arch` | Layout | Purpose |
 |---|---|---|
-| `hibrit` (varsayılan) | DDDA, global dikkat, NoPE | En iyi kalite. KV cache Transformer'ın ~1/12'si |
-| `transformer` | A (her katman), RoPE, MHA | Karşılaştırma tabanı (aynı kod, aynı eğitim) |
-| `sabit` | DDDA, 1024'lük pencere dikkati, RoPE | Global dikkat yok: çıkarım belleği bağlamdan tamamen bağımsız (O(1)) |
+| `hibrit` | DDDA, global attention, NoPE | Default hybrid; KV cache ≈ 1/12 of a same-size Transformer |
+| `transformer` | A in every layer, RoPE, MHA | Baseline (same code, same training) |
+| `sabit` | DDDA, 1024-token sliding-window attention, RoPE | No global attention: inference memory independent of context |
+| `bit` | DDDA + 1-bit FFN (see §3) | The low-bit design (use with `--bits 1` for binary, default ternary) |
 
-Düzen serbesttir: `--layout DDA`, `--layout DDDDDDDA` vb.
+The layout is free: `--layout DDA`, `--layout DDDDDDDA`, … Optional MoE FFN (`--preset moe`: 32 fine-grained experts, top-4 + shared expert, sigmoid router, aux-loss-free balancing) is implemented and unit-tested but has not been trained at scale.
+
+### Cache size (calculated for the 98 M "temel" preset, bf16, per sequence — not measured)
+| Context | Transformer (MHA, 12 layers) | Hybrid | `sabit` |
+|---|---|---|---|
+| 4 K | 151 MB | 16 MB | 7 MB |
+| 32 K | 1.21 GB | 104 MB | 7 MB |
+| 128 K | 4.83 GB | 406 MB | 7 MB |
+
+Measured: a trained 98 M hybrid reports a 5.1 MB cache after ~170 generated tokens.
 
 ---
 
-## 2. Kurulum
-
+## 2. Install
 ```bash
 cd Heimdall
-python -m venv .venv && source .venv/bin/activate
-
-# AMD ROCm (RX 9070 XT: ROCm 6.4+)
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.4
-# NVIDIA CUDA
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-
-pip install -r requirements.txt
-pip install flash-linear-attention      # isteğe bağlı, önerilir: DeltaNet için Triton çekirdekleri
-python -m pytest tests -q               # 5 test, CPU'da ~1 dk
+python3 -m venv .venv && source .venv/bin/activate
+# AMD RX 9070 XT, ROCm 10.1 (configuration we measured):
+pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1201]==2.14.0+rocm10.1.0"
+# NVIDIA CUDA (code is device-agnostic; not benchmarked by us):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install numpy tokenizers safetensors fastapi "uvicorn[standard]" pydantic huggingface_hub pyarrow httpx
+# optional: pip install flash-linear-attention lm-eval transformers
 ```
-
-**flash-linear-attention** CUDA'da ve ROCm'da (Triton) çalışır. Heimdall açılışta bu çekirdeği kendi PyTorch referansına karşı sınar. Sonuç uyuşmazsa ya da çekirdek hata verirse uyarı basar ve PyTorch yoluna döner, yani yanlış sonuç üretme riski yoktur. Log satırında hangisinin kullanıldığı yazar: `delta çekirdeği: ...`.
+Tests (CPU, ~3 min total): `python tests/test_heimdall.py && python tests/test_bifrost.py && python tests/test_bit.py && python tests/test_bitkernel.py`.
+Python 3.14 + PyTorch 2.14 supports `torch.compile` (on by default). On older stacks (PyTorch 2.9, Python 3.14) it does not; pass `--no-compile`.
 
 ---
 
-## 3. Eğitim
+## 3. Latent-free 1-bit / 1.58-bit training (`heimdall/bit.py`)
 
+Standard BitNet training keeps an fp32 "latent" copy of every weight (and Adam moments); the savings exist only at inference. Here the low-bit weight **is** the parameter:
+
+- `BitLinear` stores weights as a bf16 tensor whose values are only {−1,+1} (`bits=1`) or {−1,0,+1} (`bits=2`) — "virtual bf16": the hardware sees an ordinary matrix, and these values are exact in bf16. Output: `y = (x·Wᵀ) ⊙ (base·scale)` with a learned per-row `scale` (AdamW).
+- `BitFlip` (our optimizer) accumulates gradient momentum, normalizes it per row, and each step flips the strongest `lr` fraction of weights (binary: sign flip; ternary: one step along −1→0→+1), resetting the momentum of flipped weights. The learning rate *is* the flip fraction (default 5·10⁻³ peak, following the WSD schedule to 0).
+- Memory: 6 bytes/parameter during training (weight 2 + gradient 2 + momentum 2) versus 16–18 for AdamW with fp32 master weights.
+- Options: `--bits {1,2}`, `--bit-scope {all,ffn,mix}` (which matrices), `--bit-rank R` (dense low-rank corrector `U·V` next to each bit matrix), `--flip-orani`, `--bit-kernel int8`.
+- `--arch bit` = hybrid + FFN-only bits + rank-16 corrector. At `temel` size 58 % of parameters are 1-bit, 34 % are DeltaNet/attention mixers (Muon), 6 % embeddings.
+- Embeddings, LM head, norms, gates and small projections stay dense. Not combined with MoE.
+
+### Kernels (`heimdall/bitkernel.py`, Triton, CUDA & ROCm)
+- **int8 GEMM:** per-token int8 activations × {−1,0,1} int8 weights → int32; straight-through backward. Training uses it only if it beats bf16 (it currently does not at training shapes).
+- **Packed GEMM:** weights packed 8 per byte (1-bit) or 4 per byte (2-bit), unpacked inside the kernel, split-K for the memory-bound decode regime. `python -m heimdall.server --packed` replaces bit layers by packed ones.
+- Kernel logic is tested in Triton's CPU interpreter against torch references (`tests/test_bitkernel.py`); speed is measured on the GPU with `bench/bitkernel.py`. If a kernel fails to compile on a GPU the code falls back to the dense path with a warning.
+
+---
+
+## 4. Training
 ```bash
-# duman testi (~9M, dakikalar)
+# smoke test (~9 M params, minutes)
 python -m heimdall.train --preset mini --data ../stream_coder_100k.bin --tokens 20e6 --out runs/mini
-
-# asıl model (~100M)
-python -m heimdall.train --preset temel --data ../stream_coder_100k.bin veri/fineweb_edu_8k.bin:0.5 \
-    --tokens 2e9 --out runs/temel
-
-# devam (Ctrl+C güvenli: çıkarken kaydeder)
-python -m heimdall.train --resume runs/temel/last.pt
+# 98 M binary-FFN hybrid
+python -m heimdall.train --preset temel --arch bit --bits 1 --data ../stream_coder_100k.bin --tokens 800e6 --out runs/bit98
+# resume (Ctrl+C is safe: it saves on exit)
+python -m heimdall.train --resume runs/bit98/last.pt
 ```
-
-| Ön ayar | Hibrit param | Transformer param | d × L | T | Adım başına token | Grad ckpt |
-|---|---|---|---|---|---|---|
-| `mini` | 9.3M | 9.4M | 256 × 8 | 512 | 32K | – |
-| `kucuk` | 44.8M | 45.9M | 512 × 12 | 1024 | 128K | – |
-| `temel` | 96.1M | 98.3M | 768 × 12 | 2048 | 256K | – |
-| `buyuk` | 333M | 342M | 1024 × 24 | 2048 | 256K | ✓ |
-| `moe` | 518M toplam / 115M aktif | – | 768 × 16, 32 uzman top-4 | 2048 | 256K | – |
-
-**MoE (`--preset moe`):** ince taneli uzmanlar (32 uzman, token başına 4 + paylaşılan uzman), sigmoid yönlendirici, yardımcı kayıpsız yük dengeleme (DeepSeek-V3 tarzı). Token başına hesap `temel` ile aynı, kapasite ~5 kat. Aynı FLOP bütçesinde yoğun modelden belirgin düşük loss beklenir; DeepSeek ve OLMoE sonuçları bu yönde. Uzman ağırlıkları da Muon ile güncellenir.
-
-Eğitim yığını:
-- bf16 ve `torch.compile`.
-- **Muon** (gizli matrisler; birleşik qkv/w12 parça parça ortogonalleştirilir) + **AdamW** (embedding, norm, kapılar).
-- WSD öğrenme hızı çizelgesi.
-- Gradyan biriktirme ve kırpma, arka plan veri yükleyici.
-- ROCm bellek ayarları otomatik yapılır.
-
-OOM olursa `--micro-batch` düşür ya da `--grad-ckpt` aç. Log `runs/<ad>/log.jsonl` dosyasına da yazılır.
-
-Veri biçimi: uint16 token dosyası (`.bin`). Tokenizer: `04_TOKENIZERLAR/valerois_tokenizer_8k.json` (8192 kelime).
-
-### Transformer ile karşılaştırma (kanıt prosedürü)
-Aynı veri, aynı token, aynı optimizer. Transformer tabanının parametresi biraz daha fazla.
-```bash
-python -m heimdall.train --preset temel --arch hibrit      --data ../stream_coder_100k.bin --tokens 5e8 --out runs/hibrit
-python -m heimdall.train --preset temel --arch transformer --data ../stream_coder_100k.bin --tokens 5e8 --out runs/transformer
-python -m heimdall.compare runs/hibrit runs/transformer
-```
-Çıktıda son val loss, eşit tokende val loss ve medyan hız yer alır. Karar kuralı: hibritin val loss'u daha düşükse ve hızı en az ~%85 ise hibrit kazanır. Uzun bağlam avantajı ayrıca `--seq-len 8192` ile ölçülmeli; fark bu uzunlukta açılır.
-
----
-
-## 4. Servis (SaaS)
-
-### Paketle ve çalıştır
-```bash
-python -m heimdall.export --ckpt runs/temel/last.pt --out models/heimdall        # bf16 safetensors + config + tokenizer
-HEIMDALL_API_KEYS="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
-  python -m heimdall.server --model models/heimdall --port 8000
-```
-
-### Docker
-```bash
-docker compose --profile rocm up -d --build     # AMD
-docker compose --profile cuda up -d --build     # NVIDIA
-```
-- `models/heimdall` klasörü salt okunur bağlanır.
-- Kullanım kaydı `logs/usage.jsonl` dosyasına yazılır.
-- Anahtarlar `HEIMDALL_API_KEYS` ortam değişkeninden okunur.
-- Konteyner root olmayan kullanıcıyla çalışır ve sağlık denetimi tanımlıdır.
-- ROCm'da host'un render grubu gerekirse `RENDER_GID=$(getent group render | cut -d: -f3)` ile verilir.
-
-### API (OpenAI uyumlu)
-```bash
-curl http://localhost:8000/v1/completions -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"prompt": "def quicksort(arr):", "max_tokens": 128, "temperature": 0.2, "stop": ["\n\n\n"]}'
-```
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key=KEY)
-for chunk in client.chat.completions.create(model="heimdall", stream=True,
-                                            messages=[{"role": "user", "content": "Merhaba"}]):
-    print(chunk.choices[0].delta.content or "", end="")
-```
-
-| Uç nokta | Açıklama |
-|---|---|
-| `POST /v1/completions` | `prompt`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream` |
-| `POST /v1/chat/completions` | `messages` (system/user/assistant) + yukarıdakiler; SSE akışı |
-| `GET /v1/models` | model listesi |
-| `GET /health` | motor iş parçacığı canlı mı, aktif/kuyruk sayısı (yük dengeleyici için) |
-| `GET /metrics` | Prometheus: istek, token, gecikme, TTFT, aktif dizi, kuyruk, GPU belleği |
-
-### İşletme özellikleri
-| Özellik | Nasıl |
-|---|---|
-| **Sürekli batch'leme** | Yeni istek, çalışan batch'e bir sonraki adımda katılır; biten çıkar. Farklı uzunluktaki diziler aynı adımda ilerler. Test: tek tek üretimle birebir aynı çıktı |
-| **Kimlik doğrulama** | `Authorization: Bearer`. Bellekte ve dosyada yalnız SHA-256 özeti tutulur: `--keys-file` satırları `sha256:<hex>` olabilir |
-| **Sınırlar** | Anahtar başına dakikalık istek (`--rpm`), eşzamanlı istek (`--max-concurrent`), `--max-tokens-cap`, `--max-context` |
-| **Faturalama** | `--usage-log`: her istek için anahtar kimliği, istem/üretim token sayısı, gecikme, TTFT (JSONL) |
-| **İptal** | İstemci bağlantıyı koparırsa üretim bir sonraki adımda durur, GPU yuvası boşalır |
-| **Hata yalıtımı** | Motor hatası aktif istekleri 500 ile bitirir, servis ayakta kalır (`/metrics` → `engine_errors_total`) |
-| **Durdurma dizileri** | Akışta yakalanır. Durdurma dizisinin başı olabilecek son ek, eşleşme netleşene kadar gönderilmez |
-
-Ölçekleme: GPU başına bir süreç çalıştır, önüne bir yük dengeleyici koy (nginx, Caddy, bulut LB). TLS yük dengeleyicide sonlanır. İstekler durumsuz olduğundan yapışkan oturum gerekmez.
-
----
-
-## 5. Dosyalar
-| Dosya | İçerik |
-|---|---|
-| `heimdall/config.py` | `HeimdallConfig`, mimari türleri, ön ayarlar |
-| `heimdall/kernels.py` | RMSNorm, kısa conv, RoPE, pencere dikkati, delta kuralı (PyTorch + doğrulamalı Triton) |
-| `heimdall/model.py` | Gated DeltaNet, dikkat, blok, `HeimdallLM`, konum etiketli cache (seç/birleştir) |
-| `heimdall/optim.py` | Muon, AdamW grupları, WSD |
-| `heimdall/data.py` | .bin karışımı, validation ayrımı, arka plan yükleyici |
-| `heimdall/train.py` | Eğitim CLI |
-| `heimdall/export.py`, `io.py` | Servis paketi (safetensors) |
-| `heimdall/engine.py` | Sürekli batch'leme motoru |
-| `heimdall/server.py` | FastAPI: OpenAI uyumlu API, kimlik, sınır, metrik, kullanım kaydı |
-| `heimdall/compare.py` | Koşu karşılaştırma |
-| `docker/`, `docker-compose.yml` | CUDA ve ROCm imajları |
-| `tests/test_heimdall.py` | Delta kuralı, nedensellik, cache eşdeğerliği, sürekli batch'leme, API |
-
-## 6. Sınırlar ve yol haritası
-- **GPU'da ölçülmedi.** İlk iş: `mini` ile duman testi, sonra `temel` hibrit ve transformer karşılaştırması.
-- **Tokenizer ve veri:** 8K'lık kod tokenizer'ı ve ~60M benzersiz token, genel amaçlı bir sohbet ürünü için yetmez. SaaS'ta sohbet için daha büyük bir tokenizer (32K), genel metin ve talimat verisi gerekir. Sohbet şablonu `server.py` → `Settings.chat_template` içindedir.
-- **Tek GPU.** Çoklu GPU (DDP/FSDP) eğitimi yok.
-- **Sayfalı KV cache yok.** Global dikkat cache'i dizi başına büyür; hibritte bu Transformer'ın ~1/12'si olduğu için pratikte sınır `--max-batch × --max-context`.
-- **Nicemlenmiş servis yok** (int8/fp8).
-- `flash-linear-attention` çağrı biçimi sürümler arasında değişebilir. Açılış testi uyumsuzluğu yakalar ve PyTorch yoluna döner; o durumda eğitim daha yavaş olur ama doğru kalır.
-
----
-
-## 7. Bifrost dönüşümü: hazır Transformer → sabit bellekli model
-
-Açık bir modelin (Llama, Qwen2/3, SmolLM) her dikkat katmanı şu hale getirilir. Öğretmenin q/k/v/o ağırlıkları aynen kalır; yalnız ~%2'lik yeni parametre eğitilir.
-- **Birebir pencere:** son W token + ilk 4 çapa token için öğretmenin kendi dikkati. Kısa görevler tamamen pencereye sığar ve öğretmenle birebir aynı sonucu verir.
-- **Gecikmeli yazılan delta hafıza:** her token pencereden çıktığı anda hafızaya yazılır; pencere ve hafıza çakışmaz.
-- **Arşiv kafaları (α ≡ 1)** ve pencere içi log-normalizöre bakan **kütle kapısı**.
-- Katman başına bellek sabittir: W + 4 anahtar ve bir d×d matris.
-
-```bash
-# 1) Dönüştür (model ve wikitext otomatik iner). Katman taklidi → uçtan uca damıtma.
-python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --wikitext veri/wikitext \
-    --out kosular/smol135 --window 64 --seq-len 2048 --batch 2 --steps-a 500 --steps-b 1000 --eval-len 4096 --eval-n 32
-# 2) Benchmark (pip install lm-eval). --conv olmadan orijinal model ölçülür.
-python -m heimdall.bifrost_eval lmeval --model HuggingFaceTB/SmolLM2-135M --conv kosular/smol135/donusum_param.pt \
-    --tasks arc_easy,hellaswag,piqa
-# 3) Uzun bağlam: şifre bulma testi (1.7B+ modellerde anlamlı)
-python -m heimdall.bifrost_eval sifre --model ... --conv ... --lengths 4000 16000 64000
-```
-
-Doğrulananlar (CPU, `tests/test_bifrost.py`):
-- Öğretmen uygulaması `transformers` çıktısıyla birebir aynı.
-- Sabit bellekli token token üretim, tam paralel hesapla birebir aynı.
-- Dönüştürülen katman belleği bağlam uzunluğundan bağımsız.
-
-İlk ölçümler (SmolLM2-135M, pencere 64):
-
-| | ppl (wikitext, 2K bağlam) | ARC-Easy (40 soru) |
-|---|---|---|
-| Öğretmen | 13.09 | %52.5 |
-| Yalnız pencere | 23.66 | – |
-| Dönüşüm, eğitimsiz | 24.52 | %52.5 |
-| Dönüşüm, katman taklidi sonrası (300K token, CPU) | 21.25 | – |
-
-**Büyük modeller (`--q4`):** Donuk öğretmen matrisleri 4-bit tutulur (32'lik gruplar, asimetrik, kırpma aramalı). En hassas matrisler (v_proj, down_proj) llama.cpp'nin Q4_K_M ayarı gibi 8-bit kalır; `--hassas-bit 4` hepsini 4-bit yapar. Ağırlıklar tensör tensör yüklenir, RAM'de tam kopya oluşmaz. Qwen3-0.6B'de ölçüm (wikitext): bf16 ppl 13.88 / 840 MB → karışık 4/8-bit 14.90 / 318 MB → tamamı 4-bit 16.26 / 262 MB. Büyük modellerde nicemleme kaybı küçülür. Tahmini VRAM: Qwen3-8B karışık ~7 GB, Qwen3-14B tamamı 4-bit ~10 GB.
-
-```bash
-python -m heimdall.donustur --model Qwen/Qwen3-8B --q4 --wikitext veri/wikitext --out kosular/qwen3_8b --window 1024 --seq-len 2048 --batch 1
-```
-
-**GPU sonucu (RX 9070 XT, SmolLM2-135M, pencere 64, wikitext, 2K bağlam).** Aşama A 0.41M token (~80 sn), aşama B 0.41M token (~2.5 dk):
-
-| | ppl | 64-256. token | 1024-2048. token |
-|---|---|---|---|
-| Öğretmen (tam dikkat) | 14.09 | 15.65 | 12.59 |
-| Yalnız pencere (64 + 4 çapa) | 25.76 | 21.15 | 26.69 |
-| Dönüşüm, eğitimsiz | 26.70 | 21.55 | 27.71 |
-| Aşama A sonrası (katman taklidi) | 22.43 | 20.31 | 22.69 |
-| **Aşama B sonrası (uçtan uca damıtma)** | **17.61** | **16.98** | **17.27** |
-
-Yalnız pencere ile öğretmen arasındaki farkın ~%70'i yalnızca 0.8M tokenle kapandı; öğretmenin hâlâ %25 gerisinde (ppl 17.61 / 14.09). Aşama B kaybı eğitim bitiminde hâlâ düşüyordu. Tek model, tek tohum, 16 pencerelik ölçüm. Daha uzun eğitimin farkı ne kadar kapatacağı ölçülmedi.
-
-Uzun bağlam kalitesi henüz öğretmene ulaşmadı. Kısa benchmarklar için pencereyi 1024 yapmak skorları öğretmenle birebir aynı tutar.
-
-
----
-
-## 8. Heimdall-Bit (`--arch bit`): gizli ağırlıksız düşük bit eğitim
-
-FFN matrisleri gizli ağırlıksız üçlü (−1/0/+1, `BitFlip` optimizer), karıştırıcı projeksiyonları yoğun (Muon), her bit matrisin yanında yoğun düşük-rank düzeltici (rank 16). Embedding, LM başı ve normlar yoğun. Bit ağırlıklar toplam parametrenin `temel`'de %58'i, `buyuk`'ta %62'si.
-
-Tasarım ölçümle seçildi (`bench/bit_matrix.sh`, RX 9070 XT, d=192 L=8 hibrit, 10M token, tek tohum):
-
-| Varyant | Param | Val loss | Yoğundan fark | tok/s |
+| Preset | Hybrid params | d × L | T | Tokens / step |
 |---|---|---|---|---|
-| Yoğun | 5.8M | 1.785 | — | 78.8K |
-| Tümü üçlü | 5.8M | 2.093 | +0.308 | 72.9K |
-| Tümü ikili (±1) | 5.8M | 2.128 | +0.343 | 73.8K |
-| Tümü üçlü, %25 geniş | 8.0M | 1.994 | +0.209 | 69.5K |
-| Tümü üçlü + rank 16 | 6.3M | 1.997 | +0.212 | 66.8K |
-| Yalnız FFN üçlü | 5.8M | 1.916 | +0.131 | 76.3K |
-| **FFN üçlü + rank 16 (`--arch bit`)** | 6.1M | **1.842** | **+0.057** | 73.1K |
+| `mini` | 9.3 M | 256 × 8 | 512 | 32 K |
+| `kucuk` | 44.8 M | 512 × 12 | 1024 | 128 K |
+| `temel` | 96.1 M (`--arch bit`: 97.7 M) | 768 × 12 | 2048 | 256 K |
+| `buyuk` | 333 M | 1024 × 24 | 2048 | 256 K |
+| `moe` | 518 M total / 115 M active | 768 × 16 | 2048 | 256 K |
 
-- Kalite kaybının çoğu karıştırıcı projeksiyonlarının bit olmasından geliyor. Bitleri FFN'de tutmak farkı yarıdan aza indiriyor.
-- Düşük-rank düzeltici, %25 genişletmeyle aynı kazancı çok daha az parametreyle veriyor.
-- İkili (gerçek 1-bit) üçlüden yalnızca 0.035 geride.
-- Sınırlar: küçük model, tek tohum; 0.03 civarı farklar gürültü olabilir. Ölçekle fark nasıl değişiyor bilinmiyor: `bash bench/bit_matrix2.sh gurultu` ve `bash bench/bit_matrix2.sh olcek`.
+Stack: bf16, `torch.compile`, **Muon** (hidden dense matrices; fused qkv/w12 orthogonalized per part) + AdamW (embeddings, norms, gates) + `BitFlip`, WSD learning-rate schedule, gradient accumulation/clipping, background data loader, automatic non-finite-loss guard (stops without overwriting the last good checkpoint). Training sequence length is 2048; there is no length curriculum. On OOM lower `--micro-batch` or use `--grad-ckpt`.
 
+Data format: uint16 token files (`.bin`), mixtures as `path[:weight]`. Tokenizer: `04_TOKENIZERLAR/valerois_tokenizer_8k.json` (8192 tokens). `python -m heimdall.hazirla --repo <HF dataset> --dosya <parquet files> --kolon text --out veri/x.bin` downloads and tokenizes Hugging Face parquet data.
+
+### Overnight run (98 M, `--arch bit --bits 1`, `bench/gece.sh`)
+800 M tokens (60 % FineWeb-Edu, 32 % GitHub code, 8 % local code), 3 051 steps, 4.7 h at 47.4 K tok/s, 13.3 GB. Final validation loss: FineWeb-Edu 3.13 nats (ppl 22.9), GitHub code 0.90, local code 0.80. The code losses are optimistic (boilerplate and near-duplicates in a held-out *tail* of the training file); use a separately sourced held-out set for model comparisons (`bench/karsilastir_valkir.py`).
+Sample (T=0.8, top-k 40): syntactically valid Python with a plausible class structure but semantically wrong logic; English text collapses into repetition. This is typical for 100 M parameters / 0.8 B tokens.
+
+---
+
+## 5. Bifrost: converting a pretrained Transformer (`heimdall/donustur.py`)
+
+Each attention layer of an open model (Llama, Qwen2/3, SmolLM) is replaced by: exact **sliding-window softmax attention** over the last W tokens plus 4 attention-sink tokens (identical to the teacher inside the window), plus a **gated delta-rule memory** that receives every token when it leaves the window, plus a **mass gate** that mixes them using the window's log-normalizer. The teacher's q/k/v/o weights are reused unchanged; only ~2 % new parameters are trained, in two stages: (A) layer-wise attention transfer, (B) end-to-end KL distillation.
 ```bash
-python -m heimdall.train --preset temel --arch bit --data ../stream_coder_100k.bin --tokens 2e9 --micro-batch 4 --no-compile --out runs/temel_bit
+python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --dogrula            # exactness check vs transformers
+python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --wikitext veri/wikitext --wikitext-tokens 8e6 \
+    --out runs/smol135 --window 64 --seq-len 1024 --batch 2 --steps-a 200 --steps-b 200 --eval-len 2048 --eval-n 16
+python -m heimdall.bifrost_eval lmeval --model HuggingFaceTB/SmolLM2-135M --conv runs/smol135/donusum_param.pt --tasks arc_easy
+python -m heimdall.bifrost_eval sifre  --model ... --conv ... --lengths 4000 16000 64000     # passkey retrieval
 ```
+Result (SmolLM2-135M, window 64, GPU, 0.8 M training tokens): WikiText ppl 14.09 (original) → 25.76 (window only) → **17.61** (converted). Per bucket (tokens 1024–2048): 12.59 / 26.69 / 17.27. `--q4` keeps the frozen teacher in 4/8-bit (Qwen3-0.6B: ppl 13.88 bf16 → 14.90 mixed 4/8-bit at 318 MB → 16.26 all 4-bit); weights are streamed tensor by tensor. Verified in tests: teacher logits equal `transformers` exactly, token-by-token generation equals the parallel forward, and converted-layer cache size is independent of context length. Long-context retrieval (`sifre`) of converted models is untested at sizes where it is meaningful (≥ 1.7 B).
 
-### Hedef testi: N parametreli bit model ≥ N/2 parametreli yoğun model (`bench/hedef.sh`, RX 9070 XT)
+---
 
-| Ölçek | Yoğun (yarı boyut) | `--arch bit` üçlü FFN | `--arch bit --bits 1` (ikili FFN) |
-|---|---|---|---|
-| Küçük, tohum 0 | 2.056 (3.1M) | 1.842 (6.1M) | 1.840 |
-| Küçük, tohum 1 | 1.937 | 1.764 | 1.752 |
-| Orta, 20M token (iki koşu: derlemesiz / derlemeli) | 1.646 / 1.635 (23M) | 1.651 / 1.656 (46M) | — |
-| **Temel, 40M token (derlemeli)** | **1.309 (52M)** | 1.330 (98M) | — |
+## 6. Serving (`heimdall/server.py`, `engine.py`)
+```bash
+python -m heimdall.export --ckpt runs/bit98/last.pt --out models/heimdall            # bf16 safetensors + config + tokenizer
+HEIMDALL_API_KEYS="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+    python -m heimdall.server --model models/heimdall --port 8000 [--packed]
+docker compose --profile rocm up -d --build          # or --profile cuda  (images provided, not built in CI)
+```
+OpenAI-compatible `POST /v1/completions` and `/v1/chat/completions` (SSE streaming), `GET /v1/models`, `/health`, `/metrics` (Prometheus). **Continuous batching** (position-tagged caches allow sequences of different lengths in one step; tested to give outputs identical to one-by-one generation), SHA-256-hashed API keys, per-key request-rate and concurrency limits, usage log (JSONL) for billing, client-disconnect cancellation, engine-error isolation, streaming stop sequences. Tested with unit tests (FastAPI test client); not load-tested.
 
-- Küçük ölçekte bit model yarı boyuttaki yoğundan her iki tohumda da 0.17-0.21 nat iyi; tohumlar arası gürültü 0.08-0.12.
-- Orta ölçekte berabere (fark gürültü içinde). Hedef sınırda tutuyor; açık bir kazanç yok. Tek tohum, 20M token.
-- İkili FFN üçlüyle aynı kalitede (fark ≤ 0.01).
-- Bitler yalnız FFN'de; karıştırıcı ve embedding yoğun. Çıkarım belleği kazancı bu yüzden sınırlı.
-- Hız: bit eğitimi yoğundan %7-14 yavaş (73K'ya karşı 79-82K tok/s küçükte; 23K'ya karşı 27K tok/s ortada).
+---
 
-### Çekirdek ölçümü (RX 9070 XT, ROCm 6.4, Triton ilk sürüm)
-Paketli 1-bit üretimde bf16'dan 1.4-1.9× hızlı, doğruluk hatası 0.0017. Prefill ve eğitim şekillerinde bf16'dan yavaş (0.3-0.8×): paketli çekirdek yalnız üretim içindir. Triton int8 `tl.dot` bu sürümde derlenmedi; `torch._int_mm` yedek yolu eklendi. Python 3.14'te `torch.compile` desteklenmiyor (Python 3.12 gerekir).
+## 7. Benchmarks and reproduction
+| Script | What it measures |
+|---|---|
+| `bench/mqar.py H 8` | Multi-query associative recall (hybrid vs attention vs delta), CPU |
+| `bench/bit_matrix.sh` | 7-variant design study (§3 of the root README), ~30 min GPU |
+| `bench/bit_matrix2.sh gurultu\|olcek` | Seed noise and 46 M scale check |
+| `bench/hedef.sh hiz\|kucuk\|orta\|temel` | Kernel table + torch.compile speed; bit model vs half-size dense at 6 M, 46 M, 98 M |
+| `bench/bitkernel.py` | Kernel correctness/speed vs bf16 on the GPU |
+| `bench/boyut.sh` | Model-size/micro-batch speed probe |
+| `bench/gece.sh`, `hafta_veri.sh`, `hafta.sh` | Overnight and multi-day unattended runs (data prep, auto model choice, deadline-based token budget, auto-resume) |
+| `bench/karsilastir_valkir.py` | Same-window comparison of a checkpoint with the legacy Valkir 16L model |
+| `bench/uret.py` | Text generation from a checkpoint |
+| `python -m heimdall.compare runA runB` | Compare `log.jsonl` of runs |
 
-**Dürüst değerlendirme (RX 9070 XT, ROCm 10.1, torch 2.14, torch.compile açık).** Bit modelin yarı boyutlu yoğun modele üstünlüğü ölçekle eriyor: küçükte 0.17-0.21 nat önde, ortada berabere, 100M'de 0.022 geride. Hedef (N parametreli bit ≥ N/2 yoğun) bu ölçekte tutmuyor. Eğitimde bit modeli %15 yavaş ve %36 daha çok bellek kullanıyor (100M: 47K vs 56K tok/s, 13.3 vs 9.8 GB). Çıkarımda yalnız FFN paketlenebildiği için bellek, yarı boyutlu yoğunla aşağı yukarı aynı (hesap, ölçülmedi). Veri 25.6M token olduğu için 100M ölçekte modeller veri kısıtlı; sonuç ancak daha çok veriyle kesinleşir.
+## 8. Files
+`heimdall/config.py` configs & presets · `model.py` DeltaNet/attention/MoE/blocks/caches · `kernels.py` delta rule, attention, Triton self-test · `bit.py` low-bit layer + optimizer · `bitkernel.py` Triton kernels · `optim.py` Muon, AdamW groups, WSD · `data.py` mixtures/loader · `train.py` · `donustur.py` / `bifrost_eval.py` conversion & evaluation · `damit.py` offline top-k distillation · `engine.py` / `server.py` / `export.py` / `io.py` serving · `hazirla.py` data prep · `tests/` · `docker/`.
 
-`torch.compile` Python 3.14 + torch 2.14 + ROCm 10.1'de çalışıyor: 5.8M yoğun model 90K → 264K tok/s, bellek 3.1 → 1.3 GB, val loss değişmedi.
-
+## 9. Known limitations
+- Single GPU only; no DDP/FSDP.
+- Bit-vs-dense advantage vanishes by ~100 M parameters in our tests; scale behaviour beyond that is unknown.
+- Training kernels for low-bit matrix products are slower than bf16 on RDNA4 at training shapes; speed-ups apply to decoding only (layer-level, not end-to-end).
+- 8 K-token tokenizer and ≤ 5 B tokens of data are not enough for a general-purpose chat model; the chat template in `server.py` is a placeholder.
+- No paged KV cache; the global-attention layers' cache grows with context (≈ 1/12 of a Transformer's).
+- `github-code-clean` contains mixed-license code; check licensing before publishing weights trained on it.
