@@ -57,3 +57,8 @@ Kuzgun + arşiv kafası koşusu tamamlanmadı.
 
 ## ROCm eğitim sistemi
 `GercekMimari/` (PR: ValeroisAI/Bifrost#1). CPU'da doğrulandı, GPU'da henüz çalıştırılmadı.
+
+## Deneysel: gizli ağırlıksız üçlü eğitim + product-key hafıza (`GercekMimari`, `--uclu`, `--hafiza-katmani`)
+CPU, d=192 × 4, T=256, 1M token, val loss: yoğun 2.811 | yoğun+hafıza 2.795 | üçlü (flip %0.5) 3.074 |
+üçlü+hafıza 3.024 | donuk üçlü (alt sınır) 4.751. Üçlü eğitim öğreniyor (farkın %86'sı), eşit boyutta 0.26 nat
+geride. Açık soru: aynı VRAM'de 2.5-3× büyük üçlü model yoğunu geçer mi? GPU'da ölçülecek.

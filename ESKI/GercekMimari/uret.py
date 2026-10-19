@@ -18,6 +18,7 @@ import torch
 from tokenizers import Tokenizer
 
 from kuzgun import KuzgunConfig, KuzgunLM
+from kuzgun.cihaz import get_device
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_TOKENIZER = HERE.parent / "04_TOKENIZERLAR" / "valerois_tokenizer_8k.json"
@@ -61,7 +62,7 @@ def main() -> None:
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = get_device(args.device)
     amp = torch.autocast(device.type, dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     tok = Tokenizer.from_file(args.tokenizer)
     eos = tok.token_to_id("<eos>")

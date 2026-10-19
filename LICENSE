@@ -1,25 +1,38 @@
+Valerois AI Review License (source-available, no use rights)
+
 Copyright (c) 2026 Valerois AI. All rights reserved.
 
-PROPRIETARY AND CONFIDENTIAL
+The Heimdall / Bifrost code, documentation, kernel designs, optimizer
+implementations and all associated materials in this repository (the
+"Materials") are the intellectual property of Valerois AI.
 
-The Bifrost architecture, Valkir model family, model weights, training 
-implementations, kernel designs, optimizer stack, and all associated 
-materials described or referenced in this repository are the exclusive 
-intellectual property of Valerois AI.
+1. Permitted: REVIEW
+   Anyone may, free of charge:
+     - view and read the Materials;
+     - clone or download a copy for the sole purpose of reviewing and
+       evaluating them (for example by grant, credit-program, academic or
+       technical reviewers);
+     - run the unmodified Materials solely to verify the results reported
+       in this repository;
+     - quote short excerpts, with attribution, in reviews or evaluations.
 
-No part of this repository may be:
-  • Reproduced
-  • Distributed
-  • Modified
-  • Adapted
-  • Reverse-engineered
-  • Used for commercial purposes
-  • Used to train other models
-  • Sublicensed
+2. Not permitted without prior written permission from Valerois AI:
+     - any use other than review as described above, including commercial
+       and non-commercial production use;
+     - reproducing, redistributing or publishing the Materials;
+     - modifying, adapting, or creating derivative works;
+     - using the Materials, or anything derived from them, to train other
+       models;
+     - sublicensing, or reverse-engineering model weights or other
+       non-source artifacts.
 
-...without prior written permission from Valerois AI.
+3. No other rights are granted, by implication or otherwise. A separate
+   license that grants usage rights may be published by Valerois AI later;
+   until then, rights not expressly granted above are reserved.
 
-This repository is provided for documentation and prior-art disclosure 
-purposes only.
+4. The Materials are provided "as is", without warranty of any kind.
 
-For licensing inquiries: contact@valerois.com
+Third-party datasets, models and tokenizers referenced by the Materials
+remain under their own licenses.
+
+Contact: contact@valerois.com

@@ -1,0 +1,34 @@
+# NVIDIA:  docker compose --profile cuda up -d      AMD:  docker compose --profile rocm up -d
+# Anahtarlar:  HEIMDALL_API_KEYS=anahtar1,anahtar2  (ya da ./keys.txt + HEIMDALL_KEYS_FILE)
+x-common: &common
+  ports: ["8000:8000"]
+  volumes:
+    - ./models:/models:ro
+    - ./logs:/logs
+  environment:
+    HEIMDALL_MODEL: /models/${HEIMDALL_MODEL_DIR:-heimdall}
+    HEIMDALL_MODEL_NAME: ${HEIMDALL_MODEL_NAME:-heimdall}
+    HEIMDALL_API_KEYS: ${HEIMDALL_API_KEYS:-}
+    HEIMDALL_RPM: ${HEIMDALL_RPM:-120}
+    HEIMDALL_MAX_CONCURRENT: ${HEIMDALL_MAX_CONCURRENT:-8}
+    HEIMDALL_USAGE_LOG: /logs/usage.jsonl
+  restart: unless-stopped
+
+services:
+  heimdall-cuda:
+    <<: *common
+    profiles: ["cuda"]
+    build: {context: ., dockerfile: docker/Dockerfile.cuda}
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+
+  heimdall-rocm:
+    <<: *common
+    profiles: ["rocm"]
+    build: {context: ., dockerfile: docker/Dockerfile.rocm}
+    devices: ["/dev/kfd", "/dev/dri"]
+    group_add: ["video", "${RENDER_GID:-render}"]   # host render GID: getent group render | cut -d: -f3
+    ipc: host
+    security_opt: ["seccomp=unconfined"]

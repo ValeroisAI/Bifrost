@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
+from kuzgun.cihaz import get_device
 from uret import DEFAULT_TOKENIZER, load
 
 
@@ -101,7 +102,7 @@ def main() -> None:
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = get_device(args.device)
     amp = torch.autocast(device.type, dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
     model = load(args.ckpt, device)
     tok = Tokenizer.from_file(args.tokenizer)

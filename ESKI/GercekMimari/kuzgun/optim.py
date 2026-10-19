@@ -4,9 +4,8 @@ Muon (gizli matrisler) + AdamW (embedding, norm, conv, kapılar, skalerler) ve W
 Muon, momentumlu gradyanı Newton-Schulz ile yarı-ortogonalleştirir: her yönde benzer büyüklükte
 adım atar; aynı token bütçesinde AdamW'den belirgin hızlı öğrenir. Birleşik matrisler (qkv, w12)
 parça parça ortogonalleştirilir. GPU'da Newton-Schulz bf16'da çalışır.
+Üçlü ağırlıklar TernaryFlip (uclu.py), hafıza değer tabloları SparseRowRMS (hafiza.py) ile güncellenir.
 """
-
-from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -55,8 +54,9 @@ class Muon(torch.optim.Optimizer):
                 p.add_(u.view_as(p), alpha=-group["lr"])
 
 
-def param_groups(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[nn.Parameter]]:
-    """(muon, adam_decay, adam_no_decay). Muon: bloklardaki büyük 2D matrisler."""
+def param_groups(model: nn.Module) -> dict:
+    """muon: bloklardaki büyük yoğun 2D matrisler | adam_decay: embedding | adam_plain: geri kalan küçükler
+    ternary: üçlü ağırlıklar (TernaryFlip) | sparse: hafıza değer tabloları (SparseRowRMS)."""
     for name, m in model.named_modules():
         if isinstance(m, nn.Linear):
             if name.endswith(".qkv"):
@@ -64,34 +64,48 @@ def param_groups(model: nn.Module) -> Tuple[List[nn.Parameter], List[nn.Paramete
             elif name.endswith(".w12"):
                 m.weight.muon_split = 2
     embed_ids = {id(model.embed.weight), id(model.lm_head.weight)}
-    muon, adam_decay, adam_plain, seen = [], [], [], set()
+    groups = {k: [] for k in ("muon", "adam_decay", "adam_plain", "ternary", "sparse")}
+    seen = set()
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        if p.ndim == 2 and min(p.shape) >= 64 and id(p) not in embed_ids and "gates" not in name:
-            muon.append(p)
+        if getattr(p, "ternary", False):
+            groups["ternary"].append(p)
+        elif getattr(p, "sparse_rows", False):
+            groups["sparse"].append(p)
         elif id(p) in embed_ids:
-            adam_decay.append(p)
+            groups["adam_decay"].append(p)
+        elif p.ndim == 2 and min(p.shape) >= 64 and "gates" not in name:
+            groups["muon"].append(p)
         else:
-            adam_plain.append(p)
-    return muon, adam_decay, adam_plain
+            groups["adam_plain"].append(p)
+    return groups
 
 
 def build_optimizers(model: nn.Module, lr_muon: float = 0.02, lr_adam: float = 3e-3,
-                     weight_decay: float = 0.0, embed_decay: float = 0.0, use_muon: bool = True):
-    muon, adam_decay, adam_plain = param_groups(model)
+                     weight_decay: float = 0.0, embed_decay: float = 0.0, use_muon: bool = True,
+                     flip_rate: float = 2e-3, lr_memory: float = None) -> list:
+    """Sıra sabit (checkpoint bu sıraya göre yüklenir): [Muon], AdamW, [TernaryFlip], [SparseRowRMS]."""
+    from .hafiza import SparseRowRMS
+    from .uclu import TernaryFlip
+
+    g = param_groups(model)
     fused = {"fused": True} if torch.cuda.is_available() else {}
-    adam_groups = [{"params": adam_decay, "weight_decay": embed_decay},
-                   {"params": adam_plain, "weight_decay": 0.0}]
+    adam_groups = [{"params": g["adam_decay"], "weight_decay": embed_decay},
+                   {"params": g["adam_plain"], "weight_decay": 0.0}]
     if not use_muon:  # karşılaştırma için saf AdamW
-        adam_groups.insert(0, {"params": muon, "weight_decay": 0.1})
-        return [torch.optim.AdamW(adam_groups, lr=lr_adam, betas=(0.9, 0.95), eps=1e-8, **fused)]
+        adam_groups.insert(0, {"params": g["muon"], "weight_decay": 0.1})
     try:
         adam = torch.optim.AdamW(adam_groups, lr=lr_adam, betas=(0.9, 0.95), eps=1e-8, **fused)
     except (RuntimeError, TypeError):
         adam = torch.optim.AdamW(adam_groups, lr=lr_adam, betas=(0.9, 0.95), eps=1e-8)
-    return [Muon(muon, lr=lr_muon, weight_decay=weight_decay), adam]
+    opts = [Muon(g["muon"], lr=lr_muon, weight_decay=weight_decay), adam] if use_muon and g["muon"] else [adam]
+    if g["ternary"]:
+        opts.append(TernaryFlip(g["ternary"], lr=flip_rate))
+    if g["sparse"]:
+        opts.append(SparseRowRMS(g["sparse"], lr=lr_memory or lr_adam))
+    return opts
 
 
 def wsd(progress: float, warmup: float = 0.01, decay_start: float = 0.75, floor: float = 0.0) -> float:
