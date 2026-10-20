@@ -164,6 +164,9 @@ OpenAI-compatible `POST /v1/completions` and `/v1/chat/completions` (SSE streami
 | `bench/gece.sh`, `hafta_veri.sh`, `hafta.sh` | Overnight and multi-day unattended runs (data prep, auto model choice, deadline-based token budget, auto-resume) |
 | `bench/karsilastir_valkir.py` | Same-window comparison of a checkpoint with the legacy Valkir 16L model |
 | `bench/uret.py` | Text generation from a checkpoint |
+| `bench/dur.sh`, `devam.sh` | Cleanly pause (checkpoint at the current step) and resume the multi-day run |
+| `bench/bitnet_donustur.sh`, `ev_testi.sh` | Bifrost conversion of Microsoft BitNet b1.58-2B-4T; one-command stop → tests → plan → GPU smoke test |
+| `bench/sft_veri.py` | Merges public SFT datasets into one OpenAI-chat JSONL for fine-tuning *other* models (not used by Heimdall's own training); filters broken tool traces, deduplicates, records provenance. Note on third-party model outputs in its docstring. |
 | `python -m heimdall.compare runA runB` | Compare `log.jsonl` of runs |
 
 ## 8. Files
