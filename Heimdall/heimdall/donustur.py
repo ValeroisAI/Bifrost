@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .kernels import RMSNorm, delta_rule, delta_rule_step, rope
 
@@ -363,6 +364,7 @@ class ConvLM(nn.Module):
     def __init__(self, tc: TeacherConfig) -> None:
         super().__init__()
         self.tc = tc
+        self.grad_ckpt = False         # eğitimde katman başına yeniden hesap: aktivasyon belleği ~L kat azalır, hız ~%30 düşer
         self.embed_tokens = nn.Embedding(tc.vocab, tc.d)
         self.layers = nn.ModuleList([Layer(tc) for _ in range(tc.n_layers)])
         self.norm = RMSNorm(tc.d, tc.eps)
@@ -439,7 +441,10 @@ class ConvLM(nn.Module):
         x = self.embed_tokens(ids)
         start = cache["pos"] if cache is not None else 0
         for i, layer in enumerate(self.layers):
-            x = layer(x, None if cache is None else cache["layers"][i], start)
+            if self.grad_ckpt and cache is None and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(layer, x, None, start, use_reentrant=False)
+            else:
+                x = layer(x, None if cache is None else cache["layers"][i], start)
         if cache is not None:
             cache["pos"] += ids.size(1)
         if last_only:
@@ -599,6 +604,7 @@ def main() -> None:
     p.add_argument("--eval-n", type=int, default=12)
     p.add_argument("--sep", type=int, default=0, help="makale ayırıcı token")
     p.add_argument("--threads", type=int, default=0)
+    p.add_argument("--grad-ckpt", action="store_true", help="katman başına yeniden hesap (bellek ↓, hız ~%30 ↓); büyük modeller için")
     p.add_argument("--dogrula", action="store_true", help="yalnız transformers ile birebirlik kontrolü yap")
     p.add_argument("--q4", action="store_true", help="donuk öğretmen matrisleri 4-bit (büyük modeller 16 GB'a sığsın)")
     p.add_argument("--hassas-bit", type=int, default=8, choices=[4, 8],
@@ -622,6 +628,7 @@ def main() -> None:
 
     model = ConvLM.from_pretrained(args.model, q4=args.q4, sensitive_bits=args.hassas_bit)
     model.convert(args.window, args.sinks, args.archival_frac, set(args.keep_global))
+    model.grad_ckpt = args.grad_ckpt
     for q in model.parameters():
         q.requires_grad_(False)
     params = model.new_params()
@@ -687,8 +694,9 @@ def main() -> None:
             opt.step()
             opt.zero_grad(set_to_none=True)
             if step % 10 == 0 or step == steps:
+                peak = f" | tepe GPU {torch.cuda.max_memory_allocated() / 2**30:.1f} GB" if gpu else ""
                 print(f"  aşama {stage} adım {step}/{steps} | kayıp {loss.item():.4f} | "
-                      f"{step * x.numel() / (time.time() - t0):,.0f} tok/s", flush=True)
+                      f"{step * x.numel() / (time.time() - t0):,.0f} tok/s{peak}", flush=True)
         t0 = time.time()
         key = f"donusum_asama_{stage}"
         with amp:

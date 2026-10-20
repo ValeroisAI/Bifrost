@@ -103,7 +103,7 @@ pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device
 # NVIDIA: pip install torch --index-url https://download.pytorch.org/whl/cu128   (code is device-agnostic; CUDA was not benchmarked by us)
 pip install numpy tokenizers safetensors fastapi "uvicorn[standard]" pydantic huggingface_hub pyarrow httpx
 
-python tests/test_heimdall.py && python tests/test_bifrost.py && python tests/test_bit.py && python tests/test_bitkernel.py   # 16 tests, CPU
+for t in heimdall bifrost bit bitkernel planla arayuz; do python tests/test_$t.py; done   # 22 tests, CPU
 python -m heimdall.train --preset temel --arch bit --bits 1 --data ../stream_coder_100k.bin --tokens 40e6 --out runs/demo
 bash bench/hedef.sh orta        # reproduces the bit-vs-half-size-dense comparison (46 M vs 23 M)
 ```

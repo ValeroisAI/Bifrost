@@ -132,6 +132,15 @@ Result (SmolLM2-135M, window 64, GPU, 0.8 M training tokens): WikiText ppl 14.09
 
 ---
 
+### Will it fit? Planner and local UI (`planla.py`, `arayuz.py`)
+```bash
+python -m heimdall.planla --model Qwen/Qwen3-8B --gpu 16 --ram 32 --q4 --grad-ckpt   # reads only config.json, no weights
+python -m heimdall.arayuz                                                           # http://127.0.0.1:8765 (local only, no auth)
+```
+The planner reports parameters, frozen-teacher memory (bf16 / `--q4` / BitNet ternary int8), new trainable parameters, KV cache of the original vs. the converted model (constant), and a green/amber/red training-memory verdict. **Parameter counts and KV/state bytes are exact** (unit-tested against the real `ConvLM`); **activation and logit memory are estimates (±40 %)** to be calibrated from the `tepe GPU` (peak GPU memory) lines that `donustur` now prints. It flags unsupported inputs (MoE, `rope_scaling`, multimodal checkpoints without a text-only loader). `--grad-ckpt` recomputes layers in the backward pass (identical loss and gradients, tested; ~30 % slower, far less activation memory). A layer-by-layer disk-streamed stage A is estimated by the planner but **not implemented**. The UI plans, starts/stops a conversion and tails its log; it refuses to start while `heimdall.train` is running.
+
+BitNet b1.58 teachers: `bash bench/bitnet_donustur.sh` (defaults: batch 1, grad-ckpt). One-command check after stopping a long run: `bash bench/ev_testi.sh`.
+
 ## 6. Serving (`heimdall/server.py`, `engine.py`)
 ```bash
 python -m heimdall.export --ckpt runs/bit98/last.pt --out models/heimdall            # bf16 safetensors + config + tokenizer
@@ -158,7 +167,7 @@ OpenAI-compatible `POST /v1/completions` and `/v1/chat/completions` (SSE streami
 | `python -m heimdall.compare runA runB` | Compare `log.jsonl` of runs |
 
 ## 8. Files
-`heimdall/config.py` configs & presets · `model.py` DeltaNet/attention/MoE/blocks/caches · `kernels.py` delta rule, attention, Triton self-test · `bit.py` low-bit layer + optimizer · `bitkernel.py` Triton kernels · `optim.py` Muon, AdamW groups, WSD · `data.py` mixtures/loader · `train.py` · `donustur.py` / `bifrost_eval.py` conversion & evaluation · `damit.py` offline top-k distillation · `engine.py` / `server.py` / `export.py` / `io.py` serving · `hazirla.py` data prep · `tests/` · `docker/`.
+`heimdall/planla.py` memory planner · `arayuz.py` local web UI · `heimdall/config.py` configs & presets · `model.py` DeltaNet/attention/MoE/blocks/caches · `kernels.py` delta rule, attention, Triton self-test · `bit.py` low-bit layer + optimizer · `bitkernel.py` Triton kernels · `optim.py` Muon, AdamW groups, WSD · `data.py` mixtures/loader · `train.py` · `donustur.py` / `bifrost_eval.py` conversion & evaluation · `damit.py` offline top-k distillation · `engine.py` / `server.py` / `export.py` / `io.py` serving · `hazirla.py` data prep · `tests/` · `docker/`.
 
 ## 9. Known limitations
 - Single GPU only; no DDP/FSDP.
