@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from heimdall.donustur import ConvLM, TeacherConfig  # noqa: E402
+from heimdall.donustur import ConvLM, TeacherConfig, TernaryLinear  # noqa: E402
 
 HF = dict(hidden_size=64, num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, intermediate_size=128,
           vocab_size=97, rope_theta=10000.0, tie_word_embeddings=True)
@@ -51,8 +51,39 @@ def test_memory_constant():
     assert sizes[0] == sizes[1], sizes                       # dönüştürülen katmanlar: bağlamdan bağımsız
 
 
+def test_bitnet_ternary():
+    """BitNet b1.58 öğretmeni: üçlü ağırlık + 8-bit aktivasyon (transformers AutoBitLinear formülü), sub-norm, relu²."""
+    torch.manual_seed(0)
+    w, x = torch.randn(24, 32) * 0.05, torch.randn(3, 32)
+    s = 1.0 / w.abs().mean()
+    ref_w = (w * s).round().clamp(-1, 1) / s
+    a = 127 / x.abs().amax(-1, keepdim=True)
+    ref = torch.nn.functional.linear((x * a).round().clamp(-128, 127) / a, ref_w)
+    lin = TernaryLinear(w)
+    assert set(lin.wq.unique().tolist()) <= {-1, 0, 1}
+    assert (lin(x) - ref).abs().max() < 1e-5
+    m = ConvLM(TeacherConfig(dict(HF, model_type="bitnet", hidden_act="relu2")))
+    for layer in m.layers:                                   # yükleyicinin yaptığı gibi doğrusal katmanları üçlüye çevir
+        for parent in (layer, layer.self_attn):
+            for n, mod in list(parent.named_children()):
+                if isinstance(mod, torch.nn.Linear):
+                    setattr(parent, n, TernaryLinear(mod.weight.detach()))
+    m.convert(window=8, sinks=2)
+    m.eval().set_mode("student")
+    ids = torch.randint(0, 97, (1, 30))
+    with torch.no_grad():
+        full = m(ids)
+        c = m.new_cache()
+        step = torch.cat([m(ids[:, :5], c)] + [m(ids[:, t:t + 1], c) for t in range(5, 30)], 1)
+    # 8-bit aktivasyon yuvarlaması süreksiz: farklı toplama sırası nadiren bir basamak çevirebilir → argmax ile kontrol
+    assert (full.argmax(-1) == step.argmax(-1)).float().mean() > 0.95, (full - step).abs().max()
+    assert any(isinstance(q, TernaryLinear) for q in m.modules()) and m.new_params()
+
+
 if __name__ == "__main__":
     test_cache_equals_full()
     print("OK cache = tam hesap (öğrenci ve öğretmen modu)")
     test_memory_constant()
     print("OK dönüştürülen katman belleği sabit")
+    test_bitnet_ternary()
+    print("OK BitNet üçlü öğretmen (AutoBitLinear formülü, cache)")

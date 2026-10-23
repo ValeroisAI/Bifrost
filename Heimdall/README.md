@@ -116,6 +116,9 @@ Data format: uint16 token files (`.bin`), mixtures as `path[:weight]`. Tokenizer
 800 M tokens (60 % FineWeb-Edu, 32 % GitHub code, 8 % local code), 3 051 steps, 4.7 h at 47.4 K tok/s, 13.3 GB. Final validation loss: FineWeb-Edu 3.13 nats (ppl 22.9), GitHub code 0.90, local code 0.80. The code losses are optimistic (boilerplate and near-duplicates in a held-out *tail* of the training file); use a separately sourced held-out set for model comparisons (`bench/karsilastir_valkir.py`).
 Sample (T=0.8, top-k 40): syntactically valid Python with a plausible class structure but semantically wrong logic; English text collapses into repetition. This is typical for 100 M parameters / 0.8 B tokens.
 
+### Week-long run (337 M, `--preset buyuk --arch bit --bits 1`, `bench/hafta.sh`)
+3.70 B tokens (14 100 steps × 262 144), mixture FineWeb-Edu 55 % / Cosmopedia 21 % / GitHub code 25 %, T=2048, Muon + AdamW + WSD (decay over the last 25 % of steps), torch.compile, ~11.2 K tok/s, 11.3 GB, paused and resumed from checkpoints several times (`bench/dur.sh`, `devam.sh`). Final validation loss: FineWeb-Edu 2.707, 2.668 (2nd split), GitHub code 0.743 / 0.606, Cosmopedia 1.773. Context-length behaviour (`bench/baglam.py`), the comparison with the legacy Valkir model and their caveats are in the root README, section 7.
+
 ---
 
 ## 5. Bifrost: converting a pretrained Transformer (`heimdall/donustur.py`)
@@ -128,9 +131,18 @@ python -m heimdall.donustur --model HuggingFaceTB/SmolLM2-135M --wikitext veri/w
 python -m heimdall.bifrost_eval lmeval --model HuggingFaceTB/SmolLM2-135M --conv runs/smol135/donusum_param.pt --tasks arc_easy
 python -m heimdall.bifrost_eval sifre  --model ... --conv ... --lengths 4000 16000 64000     # passkey retrieval
 ```
-Result (SmolLM2-135M, window 64, GPU, 0.8 M training tokens): WikiText ppl 14.09 (original) → 25.76 (window only) → **17.61** (converted). Per bucket (tokens 1024–2048): 12.59 / 26.69 / 17.27. `--q4` keeps the frozen teacher in 4/8-bit (Qwen3-0.6B: ppl 13.88 bf16 → 14.90 mixed 4/8-bit at 318 MB → 16.26 all 4-bit); weights are streamed tensor by tensor. Verified in tests: teacher logits equal `transformers` exactly, token-by-token generation equals the parallel forward, and converted-layer cache size is independent of context length. Long-context retrieval (`sifre`) of converted models is untested at sizes where it is meaningful (≥ 1.7 B).
+Result (SmolLM2-135M, window 64, GPU, 0.8 M training tokens): WikiText ppl 14.09 (original) → 25.76 (window only) → **17.61** (converted). Per bucket (tokens 1024–2048): 12.59 / 26.69 / 17.27. `--q4` keeps the frozen teacher in 4/8-bit (Qwen3-0.6B: ppl 13.88 bf16 → 14.90 mixed 4/8-bit at 318 MB → 16.26 all 4-bit); weights are streamed tensor by tensor. Verified in tests: teacher logits equal `transformers` exactly, token-by-token generation equals the parallel forward, and converted-layer cache size is independent of context length. **BitNet b1.58 teachers** (`microsoft/bitnet-b1.58-2B-4T-bf16`: ternary weights, 8-bit activations, relu², sub-norms) are supported: per-layer outputs match `transformers` to ~1e-5, and on real text the full-model NLL differs by 0.004 nats (3.8335 vs 3.8299), the same as the model's own sensitivity to 1e-6 input noise (activation rounding is discontinuous). Run: `bash bench/bitnet_donustur.sh`; conversion results are not yet measured. Long-context retrieval (`sifre`) of converted models is untested at sizes where it is meaningful (≥ 1.7 B).
 
 ---
+
+### Will it fit? Planner and local UI (`planla.py`, `arayuz.py`)
+```bash
+python -m heimdall.planla --model Qwen/Qwen3-8B --gpu 16 --ram 32 --q4 --grad-ckpt   # reads only config.json, no weights
+python -m heimdall.arayuz                                                           # http://127.0.0.1:8765 (local only, no auth)
+```
+The planner reports parameters, frozen-teacher memory (bf16 / `--q4` / BitNet ternary int8), new trainable parameters, KV cache of the original vs. the converted model (constant), and a green/amber/red training-memory verdict. **Parameter counts and KV/state bytes are exact** (unit-tested against the real `ConvLM`); **activation and logit memory are estimates (±40 %)** to be calibrated from the `tepe GPU` (peak GPU memory) lines that `donustur` now prints. It flags unsupported inputs (MoE, `rope_scaling`, multimodal checkpoints without a text-only loader). `--grad-ckpt` recomputes layers in the backward pass (identical loss and gradients, tested; ~30 % slower, far less activation memory). A layer-by-layer disk-streamed stage A is estimated by the planner but **not implemented**. The UI plans, starts/stops a conversion and tails its log; it refuses to start while `heimdall.train` is running.
+
+BitNet b1.58 teachers: `bash bench/bitnet_donustur.sh` (defaults: batch 1, grad-ckpt). One-command check after stopping a long run: `bash bench/ev_testi.sh`.
 
 ## 6. Serving (`heimdall/server.py`, `engine.py`)
 ```bash
@@ -155,10 +167,14 @@ OpenAI-compatible `POST /v1/completions` and `/v1/chat/completions` (SSE streami
 | `bench/gece.sh`, `hafta_veri.sh`, `hafta.sh` | Overnight and multi-day unattended runs (data prep, auto model choice, deadline-based token budget, auto-resume) |
 | `bench/karsilastir_valkir.py` | Same-window comparison of a checkpoint with the legacy Valkir 16L model |
 | `bench/uret.py` | Text generation from a checkpoint |
+| `bench/dur.sh`, `devam.sh` | Cleanly pause (checkpoint at the current step) and resume the multi-day run |
+| `bench/bitnet_donustur.sh`, `ev_testi.sh` | Bifrost conversion of Microsoft BitNet b1.58-2B-4T; one-command stop → tests → plan → GPU smoke test |
+| `bench/lmeval_heimdall.py` | Zero-shot standard benchmarks (ARC, HellaSwag, PIQA, Winogrande, LAMBADA, WikiText word-perplexity) for a Heimdall checkpoint via lm-evaluation-harness; prints chance levels next to results. Adapter unit-tested (batched = one-by-one scoring); results and public-model comparison in the root README, section 8. `bench/ref_ozet.py` tabulates Heimdall and `lm_eval` reference runs |
+| `bench/sft_veri.py` | Merges public SFT datasets into one OpenAI-chat JSONL for fine-tuning *other* models (not used by Heimdall's own training); filters broken tool traces, deduplicates, records provenance. Note on third-party model outputs in its docstring. |
 | `python -m heimdall.compare runA runB` | Compare `log.jsonl` of runs |
 
 ## 8. Files
-`heimdall/config.py` configs & presets · `model.py` DeltaNet/attention/MoE/blocks/caches · `kernels.py` delta rule, attention, Triton self-test · `bit.py` low-bit layer + optimizer · `bitkernel.py` Triton kernels · `optim.py` Muon, AdamW groups, WSD · `data.py` mixtures/loader · `train.py` · `donustur.py` / `bifrost_eval.py` conversion & evaluation · `damit.py` offline top-k distillation · `engine.py` / `server.py` / `export.py` / `io.py` serving · `hazirla.py` data prep · `tests/` · `docker/`.
+`heimdall/planla.py` memory planner · `arayuz.py` local web UI · `heimdall/config.py` configs & presets · `model.py` DeltaNet/attention/MoE/blocks/caches · `kernels.py` delta rule, attention, Triton self-test · `bit.py` low-bit layer + optimizer · `bitkernel.py` Triton kernels · `optim.py` Muon, AdamW groups, WSD · `data.py` mixtures/loader · `train.py` · `donustur.py` / `bifrost_eval.py` conversion & evaluation · `damit.py` offline top-k distillation · `engine.py` / `server.py` / `export.py` / `io.py` serving · `hazirla.py` data prep · `tests/` · `docker/`.
 
 ## 9. Known limitations
 - Single GPU only; no DDP/FSDP.

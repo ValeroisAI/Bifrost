@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 750" font-family="Helvetica, Arial, sans-serif">
+<rect width="1100" height="760" fill="#ffffff"/>
+<text x="550" y="36" text-anchor="middle" font-size="22" font-weight="bold" fill="#111">Heimdall-Bit: hybrid memory + 1-bit FFN</text>
+
+<!-- stack -->
+<text x="30" y="75" font-size="15" font-weight="bold" fill="#111">1. Layer stack (24 layers = 6 x [D D D A])</text>
+<g font-size="14" text-anchor="middle">
+<rect x="30" y="90" width="90" height="46" rx="6" fill="#cfe8ff" stroke="#1f6fb5"/><text x="75" y="118" fill="#0b3d66">DeltaNet</text>
+<rect x="130" y="90" width="90" height="46" rx="6" fill="#cfe8ff" stroke="#1f6fb5"/><text x="175" y="118" fill="#0b3d66">DeltaNet</text>
+<rect x="230" y="90" width="90" height="46" rx="6" fill="#cfe8ff" stroke="#1f6fb5"/><text x="275" y="118" fill="#0b3d66">DeltaNet</text>
+<rect x="330" y="90" width="90" height="46" rx="6" fill="#ffd9b3" stroke="#c4640a"/><text x="375" y="118" fill="#6b3300">Attention</text>
+<text x="450" y="119" font-size="20" fill="#555">x 6</text>
+</g>
+<text x="30" y="160" font-size="13" fill="#333">D: fixed-size recurrent memory (does not grow with context).   A: global attention, no positional encoding (NoPE), GQA 16q/4kv.</text>
+<text x="30" y="180" font-size="13" fill="#333">Only 1 layer in 4 keeps a KV cache that grows with the context.</text>
+
+<!-- block -->
+<text x="30" y="225" font-size="15" font-weight="bold" fill="#111">2. One block (same for every layer; only the mixer differs)</text>
+<g font-size="14" text-anchor="middle">
+<rect x="60" y="245" width="250" height="40" rx="6" fill="#eee" stroke="#777"/><text x="185" y="270">RMSNorm</text>
+<rect x="60" y="305" width="250" height="70" rx="6" fill="#cfe8ff" stroke="#1f6fb5"/>
+<text x="185" y="330" fill="#0b3d66" font-weight="bold">Mixer (dense, bf16)</text>
+<text x="185" y="352" fill="#0b3d66" font-size="12">Gated DeltaNet  or  attention</text>
+<rect x="60" y="395" width="250" height="40" rx="6" fill="#eee" stroke="#777"/><text x="185" y="420">RMSNorm</text>
+<rect x="60" y="455" width="250" height="90" rx="6" fill="#d4f3d0" stroke="#2c8a2c" stroke-width="2"/>
+<text x="185" y="480" fill="#145214" font-weight="bold">SwiGLU FFN</text>
+<text x="185" y="502" fill="#145214" font-size="13">weights = only +1 / -1  (1-bit)</text>
+<text x="185" y="522" fill="#145214" font-size="12">+ rank-16 dense corrector, row scale</text>
+</g>
+<g stroke="#555" stroke-width="1.5" fill="none"><path d="M185 285v20M185 375v20M185 435v20"/>
+<path d="M310 265 H335 V340 H312 M310 415 H335 V500 H312" stroke-dasharray="4 3"/></g>
+<text x="346" y="302" font-size="12" fill="#555" transform="rotate(90 346 302)">+ residual</text><text x="346" y="457" font-size="12" fill="#555" transform="rotate(90 346 457)">+ residual</text>
+
+<!-- deltanet detail -->
+<text x="480" y="225" font-size="15" font-weight="bold" fill="#111">3. Gated DeltaNet: fixed-size memory</text>
+<rect x="480" y="245" width="270" height="130" rx="8" fill="#f3f9ff" stroke="#1f6fb5"/>
+<g font-size="13">
+<text x="495" y="272" fill="#0b3d66">S  : a d x d matrix (the "memory")</text>
+<text x="495" y="296" fill="#222">each token t:</text>
+<text x="495" y="318" fill="#222" font-family="monospace" font-size="12">pred = S k_t           (what memory says)</text>
+<text x="495" y="338" font-family="monospace" font-size="12" fill="#222">S &lt;- S + b_t (v_t - pred) k_t^T</text>
+<text x="495" y="358" font-family="monospace" font-size="12" fill="#222">out = S q_t</text>
+</g>
+<text x="480" y="400" font-size="13" fill="#333">Delta rule: instead of appending every token (like a KV</text>
+<text x="480" y="418" font-size="13" fill="#333">cache), it corrects the memory by the prediction error.</text>
+<text x="480" y="436" font-size="13" fill="#333">Memory size is constant at 1 K or 1 M tokens.</text>
+<text x="480" y="456" font-size="13" fill="#333">Training uses a chunk-parallel form (fast on GPU).</text>
+
+<!-- vs transformer -->
+<text x="790" y="225" font-size="15" font-weight="bold" fill="#111">4. Cache vs context</text>
+<path d="M810 250V430H1070" stroke="#999" fill="none"/>
+<text x="1070" y="448" font-size="12" text-anchor="end" fill="#333">context length</text>
+<text x="800" y="246" font-size="12" text-anchor="end" fill="#333">cache</text>
+<path d="M810 425 L1060 260" stroke="#c4640a" stroke-width="3" fill="none"/>
+<path d="M810 425 L1060 345" stroke="#1f6fb5" stroke-width="3" fill="none"/>
+<text x="1060" y="252" font-size="12" text-anchor="end" fill="#c4640a">Transformer: every layer grows</text>
+<text x="1060" y="372" font-size="12" text-anchor="end" fill="#1f6fb5">Heimdall: 1 layer in 4 grows</text>
+<text x="790" y="470" font-size="11" fill="#555">Schematic; calculated sizes in Heimdall/README.md</text>
+
+<!-- training -->
+<text x="30" y="600" font-size="15" font-weight="bold" fill="#111">5. Training the 1-bit weights without hidden fp32 copies (BitFlip)</text>
+<g font-size="13" text-anchor="middle">
+<rect x="30" y="620" width="230" height="64" rx="8" fill="#eee" stroke="#777"/><text x="145" y="646">gradient of each weight</text><text x="145" y="666" font-size="12">+ momentum (bf16)</text>
+<rect x="310" y="620" width="260" height="64" rx="8" fill="#eee" stroke="#777"/><text x="440" y="646">score = how strongly the gradient</text><text x="440" y="666">pushes against the current sign</text>
+<rect x="620" y="620" width="230" height="64" rx="8" fill="#d4f3d0" stroke="#2c8a2c"/><text x="735" y="646">flip the top ~0.5 % weights</text><text x="735" y="666" font-size="12">(learning rate = flip rate)</text>
+</g>
+<g stroke="#555" stroke-width="1.5"><path d="M260 652h50M570 652h50"/></g>
+<text x="870" y="640" font-size="12" fill="#333">6 bytes/param in training</text>
+<text x="870" y="658" font-size="12" fill="#333">(AdamW + fp32 copy: 16-18)</text>
+<text x="870" y="676" font-size="12" fill="#333">Mixers, embeddings: dense (Muon/AdamW)</text>
+
+<text x="30" y="730" font-size="12" fill="#555">337 M params ("buyuk"): d=1024, 24 layers. About 58 % of parameters (the FFNs) are 1-bit. Measured results and limitations: see README.md</text>
+</svg>
