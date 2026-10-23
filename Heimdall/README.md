@@ -169,6 +169,7 @@ OpenAI-compatible `POST /v1/completions` and `/v1/chat/completions` (SSE streami
 | `bench/uret.py` | Text generation from a checkpoint |
 | `bench/dur.sh`, `devam.sh` | Cleanly pause (checkpoint at the current step) and resume the multi-day run |
 | `bench/bitnet_donustur.sh`, `ev_testi.sh` | Bifrost conversion of Microsoft BitNet b1.58-2B-4T; one-command stop → tests → plan → GPU smoke test |
+| `bench/lmeval_heimdall.py` | Zero-shot standard benchmarks (ARC, HellaSwag, PIQA, Winogrande, LAMBADA, WikiText word-perplexity) for a Heimdall checkpoint via lm-evaluation-harness; prints chance levels next to results. Adapter unit-tested (batched = one-by-one scoring); ran end to end on a random tiny model only |
 | `bench/sft_veri.py` | Merges public SFT datasets into one OpenAI-chat JSONL for fine-tuning *other* models (not used by Heimdall's own training); filters broken tool traces, deduplicates, records provenance. Note on third-party model outputs in its docstring. |
 | `python -m heimdall.compare runA runB` | Compare `log.jsonl` of runs |
 
