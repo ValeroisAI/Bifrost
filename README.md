@@ -96,10 +96,26 @@ Loss keeps falling past the training length up to ~4 K, then rises (1.38× the 1
 
 Read this carefully: Heimdall has 2.9× the parameters, and Valkir was trained mostly by repeating a small corpus (25.6 M tokens, ~185 passes, per our legacy notes) — on that corpus it reaches 0.72 nats, so it generalizes poorly. This shows the new model is far better than the old one on unseen code; it is **not** an equal-size/equal-data comparison of architectures. We have not trained a dense Transformer baseline at this scale.
 
+### 8. Standard benchmarks, zero-shot, against small public models (same harness, same machine)
+`lm-evaluation-harness`, 0-shot, full test sets, one run (standard error ≈ ±1 point; ±1.4 on Winogrande). Heimdall was evaluated with our adapter (`bench/lmeval_heimdall.py`, 2 048-token windows); the public models through the harness's HF backend (GPT-2: 1 024-token windows, Pythia and SmolLM2: 2 048). Higher is better except perplexities.
+
+| | **Heimdall-Bit 337 M** | GPT-2 (124 M) | Pythia-160 M | Pythia-410 M | SmolLM2-135 M | chance |
+|---|---|---|---|---|---|---|
+| Training tokens | **3.7 B** | WebText (~40 GB text; token count not stated) | ~300 B | ~300 B | ~2 T | |
+| ARC-easy (acc) | 45.0 | 43.8 | 43.2 | 51.9 | 64.3 | 25 |
+| ARC-challenge (acc_norm) | 23.9 | 22.7 | 23.1 | 24.2 | 29.7 | 25 |
+| HellaSwag (acc_norm) | 32.0 | 31.1 | 30.2 | 40.5 | 43.2 | 25 |
+| PIQA (acc) | 60.8 | 62.9 | 62.1 | 66.7 | 68.3 | 50 |
+| Winogrande (acc) | 49.2 | 51.6 | 52.6 | 53.8 | 53.4 | 50 |
+| LAMBADA (acc) / ppl† | 22.5 / 84.8 | 32.6 / 40.1 | 32.7 / 38.2 | 51.5 / 10.8 | 43.0 / 19.1 | |
+| WikiText word-perplexity ↓ | 41.7 | 37.4 | 33.5 | 20.1 | 23.1 | |
+
+Reading: with 1/80 of Pythia's training tokens, Heimdall is in the same range as GPT-2-small and Pythia-160 M on ARC-easy, ARC-challenge (all at chance) and HellaSwag (differences within ~1 point), is **behind** on PIQA (−1 to −2), Winogrande (at chance), LAMBADA and WikiText (41.7 vs 33–37), and **clearly behind** Pythia-410 M and SmolLM2-135 M. It has more than twice the parameters of the models it matches, and we cannot attribute any of this to the 1-bit FFN (no dense baseline). †LAMBADA accuracy and perplexity depend on the tokenizer (our 8 K vocabulary splits words into more tokens) and are not comparable across models; WikiText *word*-perplexity is. Our mixture also spends 25 % of tokens on code, which these text benchmarks do not reward.
+
 ---
 
 ## What is *not* shown (honest limitations)
-- **Scale:** the largest model trained from scratch is 337 M parameters on 3.7 B tokens (below the ~20 tokens/parameter heuristic). The sample outputs are fluent but factually wrong and loop under greedy decoding. We have not evaluated it on standard benchmarks, and we have no dense/Transformer baseline at this scale (the 337 M run has no counterpart).
+- **Scale:** the largest model trained from scratch is 337 M parameters on 3.7 B tokens (below the ~20 tokens/parameter heuristic). The sample outputs are fluent but factually wrong and loop under greedy decoding. Standard benchmarks (section 8) place it at GPT-2-small / Pythia-160 M level, but we have no dense/Transformer baseline at this scale (the 337 M run has no counterpart), so the effect of the 1-bit FFN and of the hybrid layout on these scores is unknown.
 - The 1-bit advantage over a half-size dense model **does not persist** at ~100 M parameters in our tests.
 - Training memory is not 1-bit: bit weights cost ~6 bytes/parameter during training (weight + gradient + momentum, all bf16) versus ~16–18 for AdamW with fp32 master weights.
 - Only the FFN (58 % of parameters) is 1-bit, so inference memory is roughly on par with a half-size dense bf16 model (a calculation, not a measurement).
@@ -109,7 +125,7 @@ Read this carefully: Heimdall has 2.9× the parameters, and Valkir was trained m
 
 ## Proposed next steps (plan, depends on compute)
 1. **Scale study:** train the binary-FFN hybrid and a dense baseline at 300 M – 1 B parameters on ≥ 10 B tokens, several seeds, to learn whether the bit-vs-dense gap closes at scale.
-2. Evaluate on standard benchmarks (`lm-eval-harness`) and long-context retrieval (passkey/RULER-style) for the scratch-trained and converted models.
+2. Evaluate converted models on standard benchmarks and long-context retrieval (RULER-style); extend the scratch-trained model's long-context tests beyond a single synthetic passkey task.
 3. Convert larger open models (Qwen3 1.7–8 B, 4-bit teacher) with Bifrost and measure long-context quality and serving cost.
 4. Fused low-bit training kernels and end-to-end inference throughput measurements.
 
