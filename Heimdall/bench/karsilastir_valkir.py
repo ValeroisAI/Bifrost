@@ -57,6 +57,7 @@ def main() -> None:
 
     import valkir
     old = valkir.load(args.valkir)
+    old.sd = {k: v.to(dev) for k, v in old.sd.items()}    # Valkir ağırlıkları düz sözlükte: .to(dev) onları taşımaz
     new = load_model(args.ckpt, dev)
     print(f"Valkir: {old.n_layers} katman, alıcı alan ~{old.receptive_field()} token | "
           f"Heimdall: {new.num_params() / 1e6:.1f}M param, düzen {new.cfg.layout}, bits={new.cfg.bits}")
