@@ -116,6 +116,9 @@ Data format: uint16 token files (`.bin`), mixtures as `path[:weight]`. Tokenizer
 800 M tokens (60 % FineWeb-Edu, 32 % GitHub code, 8 % local code), 3 051 steps, 4.7 h at 47.4 K tok/s, 13.3 GB. Final validation loss: FineWeb-Edu 3.13 nats (ppl 22.9), GitHub code 0.90, local code 0.80. The code losses are optimistic (boilerplate and near-duplicates in a held-out *tail* of the training file); use a separately sourced held-out set for model comparisons (`bench/karsilastir_valkir.py`).
 Sample (T=0.8, top-k 40): syntactically valid Python with a plausible class structure but semantically wrong logic; English text collapses into repetition. This is typical for 100 M parameters / 0.8 B tokens.
 
+### Week-long run (337 M, `--preset buyuk --arch bit --bits 1`, `bench/hafta.sh`)
+3.70 B tokens (14 100 steps × 262 144), mixture FineWeb-Edu 55 % / Cosmopedia 21 % / GitHub code 25 %, T=2048, Muon + AdamW + WSD (decay over the last 25 % of steps), torch.compile, ~11.2 K tok/s, 11.3 GB, paused and resumed from checkpoints several times (`bench/dur.sh`, `devam.sh`). Final validation loss: FineWeb-Edu 2.707, 2.668 (2nd split), GitHub code 0.743 / 0.606, Cosmopedia 1.773. Context-length behaviour (`bench/baglam.py`), the comparison with the legacy Valkir model and their caveats are in the root README, section 7.
+
 ---
 
 ## 5. Bifrost: converting a pretrained Transformer (`heimdall/donustur.py`)

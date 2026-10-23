@@ -23,6 +23,7 @@ Everything below was measured on one workstation: **AMD Radeon RX 9070 XT (16 GB
 | Model | Tokens | Speed | Memory | Wall-clock |
 |---|---|---|---|---|
 | Heimdall-Bit, 98 M params (binary FFN, `--arch bit --bits 1`) | 800 M | **47.4 K tok/s** (stable for the whole run) | 13.3 GB | 4.7 h, no crash |
+| Heimdall-Bit, 337 M params (`--preset buyuk --arch bit --bits 1`) | 3.70 B | **~11.2 K tok/s** (~24 TFLOPS) | 11.3 GB | ~92 h of training, paused/resumed several times from checkpoints |
 
 `torch.compile` on the ROCm 10.1 / PyTorch 2.14 stack gave **2.9× faster training and 2.4× lower memory** than eager mode on a 5.8 M model (90 K → 264 K tok/s, 3.1 → 1.3 GB) with unchanged validation loss.
 
@@ -69,14 +70,40 @@ Single-token decoding (M=1, 4096×4096): bf16 0.228 ms → **int8 Triton 0.081 m
 ### 6. Toy recall task (MQAR, ~100 K params, 8 CPU-minutes, single seed)
 Train gap ≤ 64 tokens, tested up to 16 K: attention-only 15.6 → 0.8 %, pure DeltaNet ~14.8 %, **hybrid 99.9 → 100 %**. Small and noisy, but consistent with the design rationale.
 
+### 7. The 337 M run (3.7 B tokens): final losses, context behaviour, comparison with the legacy model
+Mixture: FineWeb-Edu 55 %, Cosmopedia 21 %, GitHub code 25 % (1.1 B code tokens). One run, one seed, WSD schedule (last 25 % of steps decays the learning rate to 0). Final validation loss, nats/token with the 8 K-vocabulary tokenizer (**not comparable to public models' perplexities**):
+
+| FineWeb-Edu | FineWeb-Edu (2nd split) | GitHub code | GitHub code (2nd split) | Cosmopedia |
+|---|---|---|---|---|
+| 2.707 (ppl 15.0) | 2.668 (ppl 14.4) | 0.743 (ppl 2.1) | 0.606 (ppl 1.8) | 1.773 (ppl 5.9) |
+
+The code losses are optimistic (boilerplate and near-duplicates in GitHub code). Samples: fluent English and plausible Python structure, but wrong facts and wrong logic, and greedy decoding loops (it is a base model: no instruction tuning).
+
+**Beyond the training length (trained at 2 048 tokens; checkpoint, held-out GitHub code, 8 windows × 8 192 tokens):**
+
+| Position | 512–1024 | 1024–2048 | 2048–4096 | 4096–8192 |
+|---|---|---|---|---|
+| Loss (nats) | 0.658 | 0.592 | **0.546** | 0.817 |
+
+Loss keeps falling past the training length up to ~4 K, then rises (1.38× the 1024–2048 value). Passkey retrieval (a 5-digit number planted in repetitive filler text; 15 trials per length): **100 % at 512, 1 K, 2 K and 4 K tokens, 80 % at 8 K** (the far-placed key fails: 2/5; middle and near: 5/5). Measured cache: 18.7 MB (512 tokens) → 109 MB (8 192 tokens), growing ~11.8 KB per token because only the global-attention layers grow; the DeltaNet layers are constant. These are small samples on an easy test (`bench/baglam.py`).
+
+**Versus the legacy Valkir 16L model (116 M params, constant-dilation CSL)**, same tokenizer, 200 held-out windows × 512 tokens from a GitHub code shard neither model trained on:
+
+| | all positions | positions 256–512 |
+|---|---|---|
+| Valkir 16L | 3.226 nats (ppl 25.2) | 3.249 |
+| Heimdall 337 M | 1.011 nats (ppl 2.75) | 0.874 |
+
+Read this carefully: Heimdall has 2.9× the parameters, and Valkir was trained mostly by repeating a small corpus (25.6 M tokens, ~185 passes, per our legacy notes) — on that corpus it reaches 0.72 nats, so it generalizes poorly. This shows the new model is far better than the old one on unseen code; it is **not** an equal-size/equal-data comparison of architectures. We have not trained a dense Transformer baseline at this scale.
+
 ---
 
 ## What is *not* shown (honest limitations)
-- **Scale:** the largest model trained from scratch is 98 M parameters on 0.8 B tokens. The sample outputs are syntactically plausible but semantically weak, as expected at this size. We have not yet compared against public models on standard benchmarks.
+- **Scale:** the largest model trained from scratch is 337 M parameters on 3.7 B tokens (below the ~20 tokens/parameter heuristic). The sample outputs are fluent but factually wrong and loop under greedy decoding. We have not evaluated it on standard benchmarks, and we have no dense/Transformer baseline at this scale (the 337 M run has no counterpart).
 - The 1-bit advantage over a half-size dense model **does not persist** at ~100 M parameters in our tests.
 - Training memory is not 1-bit: bit weights cost ~6 bytes/parameter during training (weight + gradient + momentum, all bf16) versus ~16–18 for AdamW with fp32 master weights.
 - Only the FFN (58 % of parameters) is 1-bit, so inference memory is roughly on par with a half-size dense bf16 model (a calculation, not a measurement).
-- Most comparisons use one seed; training data is 25 M – 0.8 B tokens (FineWeb-Edu, GitHub code, a small code set).
+- Most comparisons use one seed; training data is 25 M – 3.7 B tokens (FineWeb-Edu, Cosmopedia, GitHub code, a small code set). Long-context results are small-sample, single-checkpoint.
 - Multi-GPU training, a production deployment record, and quantized serving of the full model are not implemented. Docker images are provided but were not built in CI.
 - Code comments, CLI flag names and some log messages are in Turkish (glossary in [`Heimdall/README.md`](Heimdall/README.md)).
 
