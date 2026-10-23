@@ -50,13 +50,16 @@ def main() -> None:
     p.add_argument("--valkir", default=str(ROOT / "ESKI" / "Valkir.pt"))
     p.add_argument("--veri", required=True, help="uint16 .bin (ikisinin de görmediği veri)")
     p.add_argument("--n", type=int, default=200, help="pencere sayısı")
+    p.add_argument("--schedule", default="const2", choices=["exp", "const2", "const1", "mod4"],
+                   help="Valkir dilatasyon çizelgesi. Valkir.pt SABİT dilatasyon 2 ile eğitildi (ESKI/08_BIFROST_H/DURUM.md); "
+                        "yanlış çizelge kaybı şişirir (üstel: 1.73, doğru: 0.72)")
     p.add_argument("--device", default=None)
     args = p.parse_args()
     dev = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     bf16 = dev.type == "cuda"
 
     import valkir
-    old = valkir.load(args.valkir)
+    old = valkir.load(args.valkir, args.schedule)
     old.sd = {k: v.to(dev) for k, v in old.sd.items()}    # Valkir ağırlıkları düz sözlükte: .to(dev) onları taşımaz
     new = load_model(args.ckpt, dev)
     print(f"Valkir: {old.n_layers} katman, alıcı alan ~{old.receptive_field()} token | "
